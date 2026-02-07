@@ -3,7 +3,9 @@ import asyncio
 from pyrogram import Client, filters, enums
 from pyrogram.types import Message
 from config import OWNER_ID
-from database import get_all_users_count, add_ban, remove_ban, is_user_banned, check_db_connection, get_all_user_ids
+from database import (get_all_users_count, add_ban, remove_ban, is_user_banned, 
+                      check_db_connection, get_all_user_ids, add_protected_channel, 
+                      remove_protected_channel, get_protected_channels)
 
 # Ensure OWNER_ID is int
 try:
@@ -195,3 +197,70 @@ async def forwarded_id_handler(client, message):
         text += "⚠️ Could not extract source (Hidden Forward?)"
         
     await message.reply_text(text, quote=True)
+
+@Client.on_message(filters.command("protect_channel") & filters.private)
+async def protect_channel_command(client, message):
+    if message.from_user.id != OWNER_ID:
+        await message.reply_text("🔮 **Magic Detected!** 🪄\n\n"
+                                 "Oops! Looks like you're trying to use *my* magic spell! 🧙‍♂️✨\n\n"
+                                 "**मेरा जादू मुझ पर ही चलेगा!** 😎\n"
+                                 "_(My magic works for me only!)_\n\n"
+                                 "This command is for the Great Wizard only. 🏰")
+        return
+    
+    args = message.command
+    
+    if len(args) == 1:
+        # List protected channels
+        protected = await get_protected_channels()
+        if not protected:
+            await message.reply_text("🛡️ **Protected Channels**\n\n"
+                                     "No channels are protected yet.\n\n"
+                                     "**Usage:**\n"
+                                     "• `/protect_channel add <channel_id>`\n"
+                                     "• `/protect_channel remove <channel_id>`\n"
+                                     "• `/protect_channel list`")
+        else:
+            text = "🛡️ **Protected Channels**\n\n"
+            for idx, ch_id in enumerate(protected, 1):
+                text += f"{idx}. `{ch_id}`\n"
+            text += f"\n**Total:** {len(protected)} channels"
+            await message.reply_text(text)
+        return
+    
+    action = args[1].lower()
+    
+    if action in ["add", "remove"]:
+        if len(args) < 3:
+            await message.reply_text(f"❗ **Usage:** `/protect_channel {action} <channel_id>`")
+            return
+        
+        try:
+            channel_id = int(args[2])
+        except ValueError:
+            await message.reply_text("❌ Invalid channel ID. Must be a number.")
+            return
+        
+        if action == "add":
+            await add_protected_channel(channel_id)
+            await message.reply_text(f"✅ **Channel Protected!**\n\n"
+                                     f"Channel `{channel_id}` is now protected.\n"
+                                     f"Users will see a magical barrier if they try to extract from it! 🔮✨")
+        else:
+            await remove_protected_channel(channel_id)
+            await message.reply_text(f"🔓 **Protection Removed**\n\n"
+                                     f"Channel `{channel_id}` is no longer protected.")
+    
+    elif action == "list":
+        protected = await get_protected_channels()
+        if not protected:
+            await message.reply_text("🛡️ **Protected Channels**\n\nNo channels are protected.")
+        else:
+            text = "🛡️ **Protected Channels**\n\n"
+            for idx, ch_id in enumerate(protected, 1):
+                text += f"{idx}. `{ch_id}`\n"
+            text += f"\n**Total:** {len(protected)} channels"
+            await message.reply_text(text)
+    else:
+        await message.reply_text("❌ **Invalid action**\n\n"
+                                 "Use: `add`, `remove`, or `list`")

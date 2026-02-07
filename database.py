@@ -150,13 +150,99 @@ async def update_user_task(user_id, increment=1, new_reset_date=None):
 
 async def check_db_connection():
     try:
-        if mongo_client:
-            # ping
-            await mongo_client.admin.command('ping')
-            return True
-    except:
-        pass
-    return False
+        database = await get_db()
+        await database.command("ping")
+        return True
+    except Exception as e:
+        logger.error(f"DB Connection Check Failed: {e}")
+        return False
+
+# --- PROTECTED CHANNELS ---
+
+async def add_protected_channel(channel_id):
+    """Add a channel to protected list"""
+    database = await get_db()
+    await database.protected_channels.update_one(
+        {"_id": "protected_list"},
+        {"$addToSet": {"channels": channel_id}},
+        upsert=True
+    )
+
+async def remove_protected_channel(channel_id):
+    """Remove a channel from protected list"""
+    database = await get_db()
+    await database.protected_channels.update_one(
+        {"_id": "protected_list"},
+        {"$pull": {"channels": channel_id}}
+    )
+
+async def get_protected_channels():
+    """Get all protected channels"""
+    database = await get_db()
+    doc = await database.protected_channels.find_one({"_id": "protected_list"})
+    return doc.get("channels", []) if doc else []
+
+async def is_protected_channel(channel_id):
+    """Check if a channel is protected"""
+    protected = await get_protected_channels()
+    return channel_id in protected
+
+# --- LIVE BATCH MONITORS ---
+
+async def save_live_monitor(user_id, source_channel, dest_channel):
+    """Save a live monitoring configuration"""
+    database = await get_db()
+    await database.live_monitors.update_one(
+        {"user_id": user_id, "source_channel": source_channel},
+        {"$set": {
+            "dest_channel": dest_channel,
+            "active": True
+        }},
+        upsert=True
+    )
+
+async def delete_live_monitor(user_id, source_channel=None):
+    """Delete live monitor(s). If source_channel is None, delete all for user."""
+    database = await get_db()
+    if source_channel:
+        await database.live_monitors.delete_one({
+            "user_id": user_id,
+            "source_channel": source_channel
+        })
+    else:
+        await database.live_monitors.delete_many({"user_id": user_id})
+
+async def get_live_monitors(user_id):
+    """Get all live monitors for a user"""
+    database = await get_db()
+    monitors = []
+    async for doc in database.live_monitors.find({"user_id": user_id}):
+        monitors.append({
+            "source": doc["source_channel"],
+            "dest": doc["dest_channel"],
+            "active": doc.get("active", True)
+        })
+    return monitors
+
+async def get_all_live_monitors():
+    """Get all active live monitors across all users"""
+    database = await get_db()
+    monitors = []
+    async for doc in database.live_monitors.find({"active": True}):
+        monitors.append({
+            "user_id": doc["user_id"],
+            "source": doc["source_channel"],
+            "dest": doc["dest_channel"]
+        })
+    return monitors
+
+async def toggle_live_monitor(user_id, source_channel, active):
+    """Toggle a live monitor on/off"""
+    database = await get_db()
+    await database.live_monitors.update_one(
+        {"user_id": user_id, "source_channel": source_channel},
+        {"$set": {"active": active}}
+    )
 
 async def get_all_user_ids():
     database = await get_db()

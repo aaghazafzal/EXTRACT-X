@@ -1,6 +1,6 @@
 from pyrogram import Client, filters, enums
 from pyrogram.types import Message
-from database import get_session, get_settings
+from database import get_session, get_settings, is_protected_channel
 from config import API_ID, API_HASH
 from plugins.subscription import check_user_access, record_task_use, check_force_sub
 import asyncio
@@ -86,6 +86,27 @@ async def handle_batch_input(client, message):
         if "t.me/c/" not in text:
             await message.reply_text("❌ Invalid Private Channel Link. Try again.")
             return True
+        
+        # Parse channel ID from link
+        try:
+            parts = text.split("/")
+            channel_id_str = parts[-2]
+            source_id = int(f"-100{channel_id_str}")
+            
+            # Check if protected
+            if await is_protected_channel(source_id):
+                del batch_states[user_id]
+                await message.reply_text(
+                    "🔮 **Protected Channel Detected!** 🪄\n\n"
+                    "Whoa there! This channel is under a magical protection spell! ✨\n\n"
+                    "**मेरा जादू मुझ पर ही चलेगा!**\n"
+                    "_(My magic works for me only!)_\n\n"
+                    "You cannot extract from this protected channel. 🛡️\n\n"
+                    "Try another channel or contact the admin if you think this is an error."
+                )
+                return True
+        except Exception as e:
+            logger.error(f"Error parsing channel link: {e}")
         
         state["link"] = text
         state["step"] = "COUNT"

@@ -11,6 +11,7 @@ from database import init_db, update_settings, get_settings, is_user_banned, get
 from plugins.auth import handle_auth_input
 from plugins.copy_manager import handle_batch_input
 from plugins.settings import show_settings_panel
+from plugins.livebatch import handle_livebatch_input, init_live_monitors
 
 # Configure Logging
 logging.basicConfig(
@@ -43,6 +44,10 @@ async def input_handler(client, message):
 
     # Check Batch Input
     if await handle_batch_input(client, message):
+        return
+    
+    # Check Live Batch Input
+    if await handle_livebatch_input(client, message):
         return
         
     # Check Settings Add Channel Input
@@ -157,6 +162,7 @@ async def main():
         BotCommand("logout", "👋 Logout"),
         BotCommand("settings", "⚙️ Configure"),
         BotCommand("batch", "🚀 Start Copying"),
+        BotCommand("livebatch", "📡 Live Monitor"),
         BotCommand("cancel", "❌ Stop Job"),
         BotCommand("showplan", "💎 My Plan"),
         BotCommand("checkcommand", "📂 All Commands"),
@@ -165,6 +171,11 @@ async def main():
     ])
     
     print("Bot Started! Commands Set.")
+    
+    # Initialize Live Monitors
+    print("Initializing live monitors...")
+    await init_live_monitors(bot)
+    print("Live monitors ready!")
     
     # Startup Notification
     try:

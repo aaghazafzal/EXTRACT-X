@@ -42,25 +42,29 @@ PLANS = {
         "name": "Trial Plan",
         "task_limit": 5, # Lifetime? Or Daily? User said "5 times kr skta hai free". Implies Lifetime Trial.
         "file_limit": 20,
-        "duration": 0
+        "duration": 0,
+        "live_monitor_limit": 0  # No live batch for free users
     },
     "day_19": {
         "name": "Daily Pass (₹19)",
         "task_limit": 5, # Per Day
         "file_limit": 1000,
-        "duration": 86400 # 1 Day
+        "duration": 86400, # 1 Day
+        "live_monitor_limit": 2  # 2 simultaneous live monitors
     },
     "month_199": {
         "name": "Monthly Pro (₹199)",
         "task_limit": 150, # Per Month
         "file_limit": 1000,
-        "duration": 2592000 # 30 Days
+        "duration": 2592000, # 30 Days
+        "live_monitor_limit": 5  # 5 simultaneous live monitors
     },
     "unlimited_299": {
         "name": "Unlimited Access (₹299)",
         "task_limit": float('inf'),
         "file_limit": float('inf'),
-        "duration": 259200 # 3 Days
+        "duration": 259200, # 3 Days
+        "live_monitor_limit": 15  # 15 simultaneous live monitors
     }
 }
 
