@@ -1,5 +1,6 @@
 from pyrogram import Client, filters, enums
 from pyrogram.types import Message
+from pyrogram.errors import FloodWait
 from database import get_session, get_settings, is_protected_channel
 from config import API_ID, API_HASH
 from plugins.subscription import check_user_access, record_task_use, check_force_sub
@@ -319,7 +320,7 @@ async def start_copy_job(bot, message, user_id, link, limit):
                     
                     # Check Type
                     ok = False
-                    if "All Content" in active_f: ok = True # Derived from previous list check logic
+                    if "All Content" in active_f: ok = True 
                     elif filters_set.get("all"): ok = True
                     else:
                         if msg.media:
@@ -327,7 +328,13 @@ async def start_copy_job(bot, message, user_id, link, limit):
                              if mtype == enums.MessageMediaType.PHOTO and filters_set.get("photo"): ok = True
                              elif mtype == enums.MessageMediaType.VIDEO and filters_set.get("video"): ok = True
                              elif mtype == enums.MessageMediaType.DOCUMENT and filters_set.get("document"): ok = True
-                             elif filters_set.get("media"): ok = True
+                             
+                             # Enhanced "Media Only" Logic
+                             elif filters_set.get("media"): 
+                                 # Allow standard media, exclude Stickers/Service
+                                 if mtype in [enums.MessageMediaType.PHOTO, enums.MessageMediaType.VIDEO, enums.MessageMediaType.DOCUMENT, 
+                                              enums.MessageMediaType.AUDIO, enums.MessageMediaType.VOICE, enums.MessageMediaType.ANIMATION]:
+                                     ok = True
                         else:
                             if msg.text and filters_set.get("text"): ok = True
                     
@@ -350,16 +357,93 @@ async def start_copy_job(bot, message, user_id, link, limit):
                         if parts: final_caption = "\n".join(parts)
 
                     # Copy Phase
+                    # Copy Phase
                     for dest in dest_channels:
                         if active_jobs[user_id]["cancel"]: break
-                        try:
-                            try: d_id = int(dest)
-                            except: d_id = dest
-                            
-                            await userbot.copy_message(chat_id=d_id, from_chat_id=real_chat_id, message_id=msg.id, caption=final_caption)
-                            await asyncio.sleep(0.2)
-                        except Exception as e:
-                            logger.error(f"Copy Fail: {e}")
+                        try: d_id = int(dest)
+                        except: d_id = dest
+                        
+                        # Retry Mechanism
+                        success = False
+                        for attempt in range(3):
+                            if active_jobs[user_id]["cancel"]: break
+                            try:
+                                # Try fast copy first
+                                try:
+                                    await userbot.copy_message(
+                                        chat_id=d_id, 
+                                        from_chat_id=real_chat_id, 
+                                        message_id=msg.id, 
+                                        caption=final_caption
+                                    )
+                                except Exception as e:
+                                    # Check for Restricted Content Error
+                                    err_str = str(e)
+                                    if "CHAT_FORWARDS_RESTRICTED" in err_str or "restricted" in err_str.lower():
+                                        # Fallback: Manual Extraction (Download & Upload)
+                                        if msg.text:
+                                            await userbot.send_message(d_id, final_caption or msg.text)
+                                        elif msg.media:
+                                            # Download
+                                            f_path = await userbot.download_media(msg)
+                                            try:
+                                                # Upload based on type
+                                                from pyrogram import enums
+                                                if msg.photo:
+                                                    await userbot.send_photo(d_id, f_path, caption=final_caption)
+                                                elif msg.video:
+                                                    thumb_path = None
+                                                    if msg.video.thumbs:
+                                                        thumb_path = await userbot.download_media(msg.video.thumbs[0].file_id)
+                                                    
+                                                    try:
+                                                        await userbot.send_video(
+                                                            d_id, 
+                                                            f_path, 
+                                                            caption=final_caption, 
+                                                            duration=msg.video.duration, 
+                                                            width=msg.video.width, 
+                                                            height=msg.video.height, 
+                                                            thumb=thumb_path
+                                                        )
+                                                    finally:
+                                                        if thumb_path and os.path.exists(thumb_path):
+                                                            os.remove(thumb_path)
+
+                                                elif msg.document:
+                                                    await userbot.send_document(d_id, f_path, caption=final_caption, force_document=True)
+                                                elif msg.audio:
+                                                    await userbot.send_audio(d_id, f_path, caption=final_caption, duration=msg.audio.duration, performer=msg.audio.performer, title=msg.audio.title)
+                                                elif msg.voice:
+                                                    await userbot.send_voice(d_id, f_path, caption=final_caption, duration=msg.voice.duration)
+                                                elif msg.animation:
+                                                    await userbot.send_animation(d_id, f_path, caption=final_caption)
+                                                elif msg.sticker:
+                                                    await userbot.send_sticker(d_id, f_path)
+                                                else:
+                                                    # Generic doc fallback
+                                                    await userbot.send_document(d_id, f_path, caption=final_caption)
+                                            finally:
+                                                # Cleanup
+                                                import os
+                                                if f_path and os.path.exists(f_path):
+                                                    os.remove(f_path)
+                                    else:
+                                        raise e # Re-raise if not restricted error
+
+                                await asyncio.sleep(0.5) # slightly slower for safety
+                                success = True
+                                break # Done for this destination
+                                
+                            except FloodWait as e:
+                                logger.warning(f"FloodWait: Sleeping {e.value}s")
+                                await asyncio.sleep(e.value + 2)
+                            except Exception as e:
+                                logger.error(f"Copy Fail (Attempt {attempt+1}): {e}")
+                                await asyncio.sleep(2)
+                        
+                        if not success:
+                            logger.error(f"Failed to copy message {msg.id} to {dest} after retries.")
                     
                     copied += 1
                     

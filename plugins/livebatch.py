@@ -2,6 +2,7 @@ import asyncio
 import logging
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.errors import FloodWait
 from database import (get_session, get_settings, is_protected_channel, 
                       save_live_monitor, delete_live_monitor, get_live_monitors,
                       toggle_live_monitor, get_all_live_monitors, get_subscription)
@@ -356,7 +357,12 @@ async def monitor_channel(client, user_id, source_channel, dest_channel):
                     if mtype == enums.MessageMediaType.PHOTO and filters_set.get("photo"): ok = True
                     elif mtype == enums.MessageMediaType.VIDEO and filters_set.get("video"): ok = True
                     elif mtype == enums.MessageMediaType.DOCUMENT and filters_set.get("document"): ok = True
-                    elif filters_set.get("media"): ok = True
+                    
+                    # Enhanced "Media Only" Logic
+                    elif filters_set.get("media"): 
+                        if mtype in [enums.MessageMediaType.PHOTO, enums.MessageMediaType.VIDEO, enums.MessageMediaType.DOCUMENT, 
+                                     enums.MessageMediaType.AUDIO, enums.MessageMediaType.VOICE, enums.MessageMediaType.ANIMATION]:
+                            ok = True
                 elif msg.text and filters_set.get("text"):
                     ok = True
                 
@@ -387,12 +393,69 @@ async def monitor_channel(client, user_id, source_channel, dest_channel):
                 except:
                     d_id = dest_channel
                 
-                await userbot.copy_message(
-                    chat_id=d_id,
-                    from_chat_id=source_channel,
-                    message_id=msg.id,
-                    caption=final_caption
-                )
+                # Check for duplicate imports
+                import os
+                
+                try:
+                    await client.copy_message(
+                        chat_id=d_id,
+                        from_chat_id=source_channel,
+                        message_id=msg.id,
+                        caption=final_caption
+                    )
+                except Exception as e:
+                    # Check for Restricted Content Error
+                    err_str = str(e)
+                    if "CHAT_FORWARDS_RESTRICTED" in err_str or "restricted" in err_str.lower():
+                        # Fallback: Manual Extraction (Download & Upload)
+                        if msg.text:
+                            await client.send_message(d_id, final_caption or msg.text)
+                        elif msg.media:
+                            # Download
+                            f_path = await client.download_media(msg)
+                            try:
+                                # Upload based on type
+                                from pyrogram import enums
+                                if msg.photo:
+                                    await client.send_photo(d_id, f_path, caption=final_caption)
+                                elif msg.video:
+                                    thumb_path = None
+                                    if msg.video.thumbs:
+                                        thumb_path = await client.download_media(msg.video.thumbs[0].file_id)
+                                    
+                                    try:
+                                        await client.send_video(
+                                            d_id, 
+                                            f_path, 
+                                            caption=final_caption, 
+                                            duration=msg.video.duration, 
+                                            width=msg.video.width, 
+                                            height=msg.video.height, 
+                                            thumb=thumb_path
+                                        )
+                                    finally:
+                                        if thumb_path and os.path.exists(thumb_path):
+                                            os.remove(thumb_path)
+
+                                elif msg.document:
+                                    await client.send_document(d_id, f_path, caption=final_caption, force_document=True)
+                                elif msg.audio:
+                                    await client.send_audio(d_id, f_path, caption=final_caption, duration=msg.audio.duration, performer=msg.audio.performer, title=msg.audio.title)
+                                elif msg.voice:
+                                    await client.send_voice(d_id, f_path, caption=final_caption, duration=msg.voice.duration)
+                                elif msg.animation:
+                                    await client.send_animation(d_id, f_path, caption=final_caption)
+                                elif msg.sticker:
+                                    await client.send_sticker(d_id, f_path)
+                                else:
+                                    # Generic doc fallback
+                                    await client.send_document(d_id, f_path, caption=final_caption)
+                            finally:
+                                # Cleanup
+                                if f_path and os.path.exists(f_path):
+                                    os.remove(f_path)
+                    else:
+                        raise e # Re-raise if not restricted error
                 
                 logger.info(f"Live forwarded: {source_channel} → {dest_channel} (User {user_id})")
                 
