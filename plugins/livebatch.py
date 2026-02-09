@@ -1,8 +1,9 @@
 import asyncio
 import logging
-from pyrogram import Client, filters
+from pyrogram import Client, filters, enums
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import FloodWait
+import os
 from database import (get_session, get_settings, is_protected_channel, 
                       save_live_monitor, delete_live_monitor, get_live_monitors,
                       toggle_live_monitor, get_all_live_monitors, get_subscription)
@@ -352,7 +353,6 @@ async def monitor_channel(client, user_id, source_channel, dest_channel):
                 if filters_set.get("all"):
                     ok = True
                 elif msg.media:
-                    from pyrogram import enums
                     mtype = msg.media
                     if mtype == enums.MessageMediaType.PHOTO and filters_set.get("photo"): ok = True
                     elif mtype == enums.MessageMediaType.VIDEO and filters_set.get("video"): ok = True
@@ -394,7 +394,6 @@ async def monitor_channel(client, user_id, source_channel, dest_channel):
                     d_id = dest_channel
                 
                 # Check for duplicate imports
-                import os
                 
                 try:
                     await client.copy_message(
@@ -415,7 +414,6 @@ async def monitor_channel(client, user_id, source_channel, dest_channel):
                             f_path = await client.download_media(msg)
                             try:
                                 # Upload based on type
-                                from pyrogram import enums
                                 if msg.photo:
                                     await client.send_photo(d_id, f_path, caption=final_caption)
                                 elif msg.video:

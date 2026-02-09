@@ -7,6 +7,7 @@ from plugins.subscription import check_user_access, record_task_use, check_force
 import asyncio
 import logging
 import time
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -384,11 +385,9 @@ async def start_copy_job(bot, message, user_id, link, limit):
                                         if msg.text:
                                             await userbot.send_message(d_id, final_caption or msg.text)
                                         elif msg.media:
-                                            # Download
                                             f_path = await userbot.download_media(msg)
                                             try:
                                                 # Upload based on type
-                                                from pyrogram import enums
                                                 if msg.photo:
                                                     await userbot.send_photo(d_id, f_path, caption=final_caption)
                                                 elif msg.video:
@@ -425,7 +424,6 @@ async def start_copy_job(bot, message, user_id, link, limit):
                                                     await userbot.send_document(d_id, f_path, caption=final_caption)
                                             finally:
                                                 # Cleanup
-                                                import os
                                                 if f_path and os.path.exists(f_path):
                                                     os.remove(f_path)
                                     else:
