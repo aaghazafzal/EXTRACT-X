@@ -200,10 +200,13 @@ async def start_copy_job(bot, message, user_id, link, limit):
 
         # Parse Link
         try:
-            parts = link.split("/")
-            channel_id_str = parts[-2]
+            parts = link.rstrip("/").split("/")
             start_msg_id = int(parts[-1])
-            source_id = int(f"-100{channel_id_str}")
+            if "c" in parts:
+                channel_id_str = parts[-2]
+                source_id = int(f"-100{channel_id_str}")
+            else:
+                source_id = parts[-2] # Public channel username
             
             # 1. Verify Access & Get Chat Info
             real_chat_id = source_id
@@ -384,7 +387,30 @@ async def start_copy_job(bot, message, user_id, link, limit):
 
                     # Copy Phase
                     # Copy Phase
-                    for dest in dest_channels:
+                    # Copy Phase
+                    uploaded_restricted_msg = None
+                    
+                    def get_progress_func(action_name):
+                        last_update = [time.time()]
+                        async def progress(current, total):
+                            now = time.time()
+                            if (now - last_update[0]) > 4:
+                                percent = (current / total) * 100 if total else 0
+                                curr_mb = current / (1024 * 1024)
+                                tot_mb = total / (1024 * 1024) if total else 0
+                                try:
+                                    await status_msg.edit_text(
+                                        f"⚙️ **Manual Extraction** ⚙️\n\n"
+                                        f"🚀 **Action:** `{action_name}`\n"
+                                        f"📊 **Progress:** `{percent:.1f}%`\n"
+                                        f"📦 **Size:** `{curr_mb:.1f} MB` / `{tot_mb:.1f} MB`\n\n"
+                                        f"_(Fast multi-target sync enabled)_"
+                                    )
+                                    last_update[0] = now
+                                except: pass
+                        return progress
+
+                    for i, dest in enumerate(dest_channels):
                         if active_jobs[user_id]["cancel"]: break
                         try: d_id = int(dest)
                         except: d_id = dest
@@ -394,6 +420,18 @@ async def start_copy_job(bot, message, user_id, link, limit):
                         for attempt in range(3):
                             if active_jobs[user_id]["cancel"]: break
                             try:
+                                # Optimization: If we already manually uploaded it to one destination,
+                                # we can just forward IT to the other destinations instantly!
+                                if uploaded_restricted_msg is not None:
+                                    await userbot.copy_message(
+                                        chat_id=d_id, 
+                                        from_chat_id=uploaded_restricted_msg.chat.id, 
+                                        message_id=uploaded_restricted_msg.id, 
+                                        caption=final_caption
+                                    )
+                                    success = True
+                                    break
+
                                 # Try fast copy first
                                 try:
                                     await userbot.copy_message(
@@ -411,78 +449,61 @@ async def start_copy_job(bot, message, user_id, link, limit):
                                             await status_msg.edit_text(
                                                 f"🔒 **Restricted Content Detected**\n\n"
                                                 f"Channel blocks forwarding.\n"
-                                                f"Switching to **Manual Download Mode**...\n\n"
-                                                f"_(This will be slower but works)_"
+                                                f"Switching to **Download/Upload Mode**..."
                                             )
                                         except: pass
                                         
                                         # Fallback: Manual Extraction (Download & Upload)
+                                        sent_msg = None
                                         if msg.text:
-                                            await userbot.send_message(d_id, final_caption or msg.text)
+                                            sent_msg = await userbot.send_message(d_id, final_caption or msg.text)
                                         elif msg.media:
-                                            # Status Update for Large Files
-                                            file_size = 0
-                                            try:
-                                                if msg.document: file_size = msg.document.file_size
-                                                elif msg.video: file_size = msg.video.file_size
-                                                elif msg.audio: file_size = msg.audio.file_size
-                                                
-                                                if file_size > 50 * 1024 * 1024: # 50MB
-                                                    size_mb = f"{file_size / (1024*1024):.1f}"
-                                                    await status_msg.edit_text(
-                                                        f"📥 **Downloading Large File...**\n"
-                                                        f"📦 **Size:** `{size_mb} MB`\n"
-                                                        f"⏳ **Please Wait...**\n\n"
-                                                        f"_(This message will update after download)_"
-                                                    )
-                                            except: pass
-
-                                            f_path = await userbot.download_media(msg)
+                                            f_path = await userbot.download_media(msg, progress=get_progress_func("Downloading from Source"))
                                             
-                                            # Update Status for Upload
-                                            if file_size > 50 * 1024 * 1024:
-                                                try: await status_msg.edit_text(f"📤 **Uploading...**\n📦 **Size:** `{size_mb} MB`")
-                                                except: pass
                                             try:
                                                 # Upload based on type
                                                 if msg.photo:
-                                                    await userbot.send_photo(d_id, f_path, caption=final_caption)
+                                                    sent_msg = await userbot.send_photo(d_id, f_path, caption=final_caption, progress=get_progress_func("Uploading to Target"))
                                                 elif msg.video:
                                                     thumb_path = None
-                                                    if msg.video.thumbs:
+                                                    if getattr(msg.video, "thumbs", None):
                                                         thumb_path = await userbot.download_media(msg.video.thumbs[0].file_id)
                                                     
                                                     try:
-                                                        await userbot.send_video(
+                                                        sent_msg = await userbot.send_video(
                                                             d_id, 
                                                             f_path, 
                                                             caption=final_caption, 
                                                             duration=msg.video.duration, 
                                                             width=msg.video.width, 
                                                             height=msg.video.height, 
-                                                            thumb=thumb_path
+                                                            thumb=thumb_path,
+                                                            progress=get_progress_func("Uploading to Target")
                                                         )
                                                     finally:
                                                         if thumb_path and os.path.exists(thumb_path):
                                                             os.remove(thumb_path)
-
                                                 elif msg.document:
-                                                    await userbot.send_document(d_id, f_path, caption=final_caption, force_document=True)
+                                                    sent_msg = await userbot.send_document(d_id, f_path, caption=final_caption, force_document=True, progress=get_progress_func("Uploading to Target"))
                                                 elif msg.audio:
-                                                    await userbot.send_audio(d_id, f_path, caption=final_caption, duration=msg.audio.duration, performer=msg.audio.performer, title=msg.audio.title)
+                                                    sent_msg = await userbot.send_audio(d_id, f_path, caption=final_caption, duration=msg.audio.duration, performer=msg.audio.performer, title=msg.audio.title, progress=get_progress_func("Uploading to Target"))
                                                 elif msg.voice:
-                                                    await userbot.send_voice(d_id, f_path, caption=final_caption, duration=msg.voice.duration)
+                                                    sent_msg = await userbot.send_voice(d_id, f_path, caption=final_caption, duration=msg.voice.duration, progress=get_progress_func("Uploading to Target"))
                                                 elif msg.animation:
-                                                    await userbot.send_animation(d_id, f_path, caption=final_caption)
+                                                    sent_msg = await userbot.send_animation(d_id, f_path, caption=final_caption, progress=get_progress_func("Uploading to Target"))
                                                 elif msg.sticker:
-                                                    await userbot.send_sticker(d_id, f_path)
+                                                    sent_msg = await userbot.send_sticker(d_id, f_path, progress=get_progress_func("Uploading to Target"))
                                                 else:
                                                     # Generic doc fallback
-                                                    await userbot.send_document(d_id, f_path, caption=final_caption)
+                                                    sent_msg = await userbot.send_document(d_id, f_path, caption=final_caption, progress=get_progress_func("Uploading to Target"))
                                             finally:
                                                 # Cleanup
                                                 if f_path and os.path.exists(f_path):
                                                     os.remove(f_path)
+                                        
+                                        # Save the manually uploaded message to instantly forward it to other targets!
+                                        if sent_msg:
+                                            uploaded_restricted_msg = sent_msg
                                     else:
                                         raise e # Re-raise if not restricted error
 
