@@ -42,10 +42,7 @@ async def batch_start(client, message):
 
     user_id = message.from_user.id
     
-    # Check Login
-    if not await get_session(user_id):
-        await message.reply_text("⛔ You are not logged in!\nUse /login first.")
-        return
+    # Session will be checked later if the URL is private.
     
     # Check already running
     if user_id in active_jobs:
@@ -95,6 +92,9 @@ async def handle_batch_input(client, message):
             parts = raw_link.split("/")
             
             if "c" in parts:
+                if not await get_session(user_id):
+                    await message.reply_text("⛔ You must be logged in to extract from private links!\nUse /login first.")
+                    return True
                 channel_id_str = parts[-2]
                 source_id = int(f"-100{channel_id_str}")
             else:
@@ -192,20 +192,9 @@ async def start_copy_job(bot, message, user_id, link, limit):
         filters_set = settings["filters"]
         caption_rules = settings.get("caption_rules", {})
         
-        # Start Userbot
-        userbot = Client(f"worker_{user_id}", api_id=API_ID, api_hash=API_HASH, session_string=session, in_memory=True)
+        # Parse Link First to Determine Worker Type
         try:
-            await userbot.start()
-            # Record Usage (Charge User)
-            await record_task_use(user_id)
-        except Exception as e:
-            await status_msg.edit_text(f"🚫 **Login Error**\n\nCould not connect to user account.\nReason: `{e}`")
-            if user_id in active_jobs: del active_jobs[user_id]
-            return
-
-        # Parse Link
-        try:
-            # Clean link: specifically strip off query parameters (like ?single) which crash int conversion
+            # Clean link: specifically strip off query parameters (like ?single)
             raw_link = link.rstrip("/").split("?")[0]
             parts = raw_link.split("/")
             start_msg_id = int(parts[-1])
@@ -213,8 +202,29 @@ async def start_copy_job(bot, message, user_id, link, limit):
             if "c" in parts:
                 channel_id_str = parts[-2]
                 source_id = int(f"-100{channel_id_str}")
+                is_public = False
             else:
                 source_id = parts[-2] # Public channel username
+                is_public = True
+
+            # Record Usage (Charge User)
+            await record_task_use(user_id)
+            
+            if is_public:
+                userbot = client
+            else:
+                if not session:
+                    await status_msg.edit_text("🚫 **Login Error**\n\nYou need to login to extract from private channels.")
+                    if user_id in active_jobs: del active_jobs[user_id]
+                    return
+                    
+                userbot = Client(f"worker_{user_id}", api_id=API_ID, api_hash=API_HASH, session_string=session, in_memory=True)
+                try:
+                    await userbot.start()
+                except Exception as e:
+                    await status_msg.edit_text(f"🚫 **Login Error**\n\nCould not connect to user account.\nReason: `{e}`")
+                    if user_id in active_jobs: del active_jobs[user_id]
+                    return
             
             # 1. Verify Access & Get Chat Info
             real_chat_id = source_id
@@ -593,8 +603,9 @@ async def start_copy_job(bot, message, user_id, link, limit):
             current_id += batch_size
             await asyncio.sleep(2.0) # Safety between GetMessages
         
-        if 'userbot' in locals():
-            await userbot.stop()
+        if 'userbot' in locals() and userbot != client:
+            try: await userbot.stop()
+            except: pass
         
         # Final Report Card
         final_text = ""
