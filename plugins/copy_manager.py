@@ -258,9 +258,13 @@ async def start_copy_job(bot, message, user_id, link, limit):
             
             # 2. Get Real Last Message ID (Crucial for Stopping)
             real_last_msg_id = 0
-            async for last_msg in userbot.get_chat_history(real_chat_id, limit=1):
-                real_last_msg_id = last_msg.id
-                break
+            if is_public:
+                # Bots cannot use get_chat_history. Synthesize upper bound ceiling dynamically.
+                real_last_msg_id = start_msg_id + (int(limit) if limit != float('inf') else 100000)
+            else:
+                async for last_msg in userbot.get_chat_history(real_chat_id, limit=1):
+                    real_last_msg_id = last_msg.id
+                    break
             
             if real_last_msg_id == 0:
                 await status_msg.edit_text("⚠️ **Channel Empty**\n\nNo messages found in the source channel.")
@@ -332,6 +336,7 @@ async def start_copy_job(bot, message, user_id, link, limit):
         copied = 0
         current_id = start_msg_id
         fail_count = 0
+        consecutive_empty_batches = 0
         last_update_time = time.time()
         
         while True:
@@ -356,9 +361,13 @@ async def start_copy_job(bot, message, user_id, link, limit):
                 
                 # Check empty batch (skipped IDs)
                 valid_msgs = [m for m in msgs if m and not m.empty]
-                if not valid_msgs and batch_size > 0:
-                     # Just move forward, don't fail immediately, maybe just gaps
-                     pass 
+                if not valid_msgs:
+                     consecutive_empty_batches += 1
+                     if consecutive_empty_batches > 3: # End of channel reached
+                         break
+                     # Just move forward, maybe just large gaps
+                else:
+                     consecutive_empty_batches = 0
 
                 for msg in msgs:
                     # Inner Checks
