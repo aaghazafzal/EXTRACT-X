@@ -499,6 +499,27 @@ async def start_copy_job(bot, message, user_id, link, limit):
                                         if msg.text:
                                             sent_msg = await userbot.send_message(d_id, final_caption or msg.text)
                                         elif msg.media:
+                                            # Pre-check file size to avoid infinite download and failed upload loops
+                                            f_size = 0
+                                            for prop in ['video', 'audio', 'document', 'voice', 'animation', 'photo', 'sticker']:
+                                                obj = getattr(msg, prop, None)
+                                                if obj and hasattr(obj, 'file_size') and obj.file_size:
+                                                    f_size = obj.file_size
+                                                    break
+                                            
+                                            if f_size and f_size > 2040000000: # Slightly under 2GB
+                                                mb_sz = f_size / (1024 * 1024)
+                                                try:
+                                                    await message.reply_text(
+                                                        f"⚠️ **File Skipped** (Too Large)\n\n"
+                                                        f"**ID:** `{msg.id}`\n"
+                                                        f"**Size:** `{mb_sz:.2f} MB`\n"
+                                                        f"Telegram restricts manual uploads to 2GB. Skipping to protect extraction engine."
+                                                    )
+                                                except: pass
+                                                success = True
+                                                break
+                                                
                                             f_path = await userbot.download_media(msg, progress=get_progress_func("Downloading from Source"))
                                             
                                             try:
