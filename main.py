@@ -44,6 +44,20 @@ async def input_handler(client, message):
         await message.reply_text("🚫 **Access Denied**\n\nYou are restricted from using this bot.\nContact Admin for support.")
         return
 
+    # User Command Interceptor (Cancel Pending States)
+    if message.text and message.text.startswith("/"):
+        canceled = False
+        if hasattr(client, "waiting_channel_user") and client.waiting_channel_user == message.from_user.id:
+            del client.waiting_channel_user
+            canceled = True
+        if hasattr(client, "waiting_input") and client.waiting_input.get("user") == message.from_user.id:
+            del client.waiting_input
+            canceled = True
+        
+        if canceled:
+            await message.reply_text("🚫 **Action Cancelled** (New command detected).")
+        return
+
     # Check Auth Input
     if await handle_auth_input(client, message):
         return
@@ -62,7 +76,15 @@ async def input_handler(client, message):
     # For now, let's implement the Add Channel input logic here simply.
     # Check Settings Input (Channel Add, Captions)
     if hasattr(client, "waiting_channel_user") and client.waiting_channel_user == message.from_user.id:
-        new_channel = message.text.strip()
+        new_channel = None
+        if message.forward_from_chat:
+            new_channel = str(message.forward_from_chat.id)
+        elif message.text:
+            new_channel = message.text.strip()
+        
+        if not new_channel:
+            await message.reply_text("⚠️ **Invalid Input**\nPlease send a valid Channel ID, Username, or forward a message from the channel.")
+            return
         
         # Proper append logic
         s = await get_settings(message.from_user.id)

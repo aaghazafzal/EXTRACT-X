@@ -163,19 +163,20 @@ async def caption_settings_handler(client, callback: CallbackQuery):
         
     elif action == "cap_add_rem":
         client.waiting_input = {"user": user_id, "type": "rem_word"}
-        await callback.message.reply_text("🗣 **Send the word/phrase to REMOVE:**")
+        await callback.message.reply_text("🗣 **Send the word/phrase to REMOVE:**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel_input")]]))
         
     elif action == "cap_add_rep":
         client.waiting_input = {"user": user_id, "type": "rep_word_old"}
-        await callback.message.reply_text("🗣 **Send the OLD word (to be replaced):**")
+        await callback.message.reply_text("🗣 **Send the OLD word (to be replaced):**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel_input")]]))
 
     # Prefix/Suffix Inputs
     elif action == "cap_prefix":
         client.waiting_input = {"user": user_id, "type": "set_prefix"}
-        await callback.message.reply_text("🗣 **Send the Prefix Text** (appears at start):")
+        await callback.message.reply_text("🗣 **Send the Prefix Text** (appears at start):", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel_input")]]))
     elif action == "cap_suffix":
         client.waiting_input = {"user": user_id, "type": "set_suffix"}
-        await callback.message.reply_text("🗣 **Send the Suffix Text** (appears at end):")
+        await callback.message.reply_text("🗣 **Send the Suffix Text** (appears at end):", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel_input")]]))
+
         
     elif action == "cap_clear":
         rules = {"removals": [], "replacements": {}, "prefix": "", "suffix": ""}
@@ -216,11 +217,16 @@ async def channel_manager(client, callback: CallbackQuery):
         text += "No channels added yet."
     else:
         for i, ch in enumerate(channels, 1):
-            text += f"{i}. `{ch}`\n"
+            try:
+                chat = await client.get_chat(ch)
+                title = chat.title or "Private Channel"
+            except:
+                title = "Unknown Channel"
+            text += f"{i}. 📚 **{title}** (`{ch}`)\n"
             
     kb = [
         [InlineKeyboardButton("➕ Add Channel", callback_data="add_channel")],
-        [InlineKeyboardButton("🗑 Delete Channel", callback_data="del_channel")],
+        [InlineKeyboardButton("🗑 Delete Channel", callback_data="del_channel_menu")],
         [InlineKeyboardButton("🔙 Back", callback_data="back_settings")]
     ]
     await edit_or_reply(callback.message, text, InlineKeyboardMarkup(kb))
@@ -231,32 +237,65 @@ async def back_settings(client, callback: CallbackQuery):
     # Determine if we go to main settings or somewhere else
     await show_settings_panel(callback.from_user.id, callback.message, is_edit=True)
 
-@Client.on_callback_query(filters.regex("^(add_channel|del_channel)"))
+@Client.on_callback_query(filters.regex("^(add_channel|del_channel_menu|del_channel_idx_|cancel_input)"))
 async def channel_actions_handler(client, callback: CallbackQuery):
     action = callback.data
     user_id = callback.from_user.id
     
-    if action == "add_channel":
+    if action == "cancel_input":
+        canceled = False
+        if hasattr(client, "waiting_channel_user") and client.waiting_channel_user == user_id:
+            del client.waiting_channel_user
+            canceled = True
+        if hasattr(client, "waiting_input") and client.waiting_input.get("user") == user_id:
+            del client.waiting_input
+            canceled = True
+            
+        if canceled:
+            await callback.message.edit_text("🚫 **Action Cancelled.**")
+        else:
+            await callback.answer("Nothing to cancel.", show_alert=True)
+            
+    elif action == "add_channel":
         client.waiting_channel_user = user_id
         # Send a new message for input to avoid confusing the menu state
+        kb = [[InlineKeyboardButton("❌ Cancel", callback_data="cancel_input")]]
         await callback.message.reply_text(
             "📝 **New Channel Setup**\n\n"
-            "Please send the **Channel ID** (e.g., `-10012345678`) or **Username** (`@mychannel`).\n"
-            "⚠️ **Note:** Ensure your User Account is an Admin in that channel!"
+            "Please send the **Channel ID** (`-100...`), **Username** (`@...`), or **Forward a message** from it.\n"
+            "⚠️ **Note:** Ensure your User Account is an Admin in that channel!",
+            reply_markup=InlineKeyboardMarkup(kb)
         )
         await callback.answer()
 
-    elif action == "del_channel":
+    elif action == "del_channel_menu":
         settings = await get_settings(user_id)
-        if not settings or not settings["dest_channels"]:
+        if not settings or not settings.get("dest_channels"):
             await callback.answer("❌ No channels to delete!", show_alert=True)
             return
         
-        current = settings["dest_channels"]
-        removed = current.pop() # Remove last one
+        channels = settings["dest_channels"]
+        text = "🗑 **Select a Channel to Delete:**\n\n"
+        kb = []
+        for i, ch in enumerate(channels):
+            try:
+                chat = await client.get_chat(ch)
+                title = chat.title or "Private Channel"
+            except:
+                title = f"Channel {ch}"
+            kb.append([InlineKeyboardButton(f"❌ Delete {title[:20]}", callback_data=f"del_channel_idx_{i}")])
+            
+        kb.append([InlineKeyboardButton("🔙 Back", callback_data="set_channels")])
+        await edit_or_reply(callback.message, text, InlineKeyboardMarkup(kb))
         
-        await update_settings(user_id, dest_channels=current)
-        await callback.answer(f"🗑 Removed: {removed}")
-        
+    elif action.startswith("del_channel_idx_"):
+        idx = int(action.split("_")[-1])
+        settings = await get_settings(user_id)
+        if settings and settings.get("dest_channels"):
+            current = settings["dest_channels"]
+            if 0 <= idx < len(current):
+                removed = current.pop(idx)
+                await update_settings(user_id, dest_channels=current)
+                await callback.answer(f"🗑 Removed Channel ID: {removed}")
         # Refresh the Channel Manager View
         await channel_manager(client, callback)
