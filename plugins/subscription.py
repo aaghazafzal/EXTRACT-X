@@ -166,6 +166,14 @@ async def add_premium(client, message):
         
         await message.reply_text(f"✅ **Premium Added!**\n\nUser: `{target_id}`\nPlan: `{PLANS[plan_id]['name']}`\nExpires: `{datetime.datetime.fromtimestamp(expiry)}`")
         
+        # Log Admin Action
+        try:
+            await client.send_message(
+                -1003748199616,
+                f"🎁 **PREMIUM GRANTED**\n\n👤 **User ID:** `{target_id}`\n💎 **Plan:** `{PLANS[plan_id]['name']}`\n⏳ **Duration:** `{duration} days`\n👮‍♂️ **By Admin:** `{message.from_user.id}`"
+            )
+        except: pass
+        
         # Notify User
         try:
              await client.send_message(target_id, f"🎉 **Premium Activated!**\n\nYou have been upgraded to **{PLANS[plan_id]['name']}**.\nEnjoy advanced features!")
@@ -186,6 +194,14 @@ async def remove_premium(client, message):
         target_id = int(args[1])
         await set_subscription(target_id, "free", 0)
         await message.reply_text(f"✅ **Premium Removed.** User {target_id} is now on Free Plan.")
+        
+        # Log Admin Action
+        try:
+            await client.send_message(
+                -1003748199616,
+                f"🔻 **PREMIUM REVOKED**\n\n👤 **User ID:** `{target_id}`\n👮‍♂️ **By Admin:** `{message.from_user.id}`"
+            )
+        except: pass
         
     except Exception as e:
         await message.reply_text(f"Error: {e}")
@@ -262,3 +278,15 @@ async def show_plan(client, message):
     )
     
     await message.reply_text(text)
+    
+    # Log User Checking Plan
+    try:
+        log_text = (
+            "💳 **PLAN CHECKED!**\n\n"
+            f"👤 **User:** [{message.from_user.first_name}](tg://user?id={user_id})\n"
+            f"🆔 **ID:** `{user_id}`\n"
+            f"💎 **Current Plan:** `{plan_info['name']}`\n"
+            f"📊 **Tasks Used:** `{tasks_done}` / `{limit_text}`"
+        )
+        await client.send_message(-1003748199616, log_text)
+    except: pass

