@@ -125,10 +125,16 @@ async def caption_settings_handler(client, callback: CallbackQuery):
         kb = [
             [InlineKeyboardButton("🚫 Manage Removals", callback_data="cap_rem_menu")],
             [InlineKeyboardButton("🔄 Manage Replacements", callback_data="cap_rep_menu")],
-            [InlineKeyboardButton("🔡 Set Prefix", callback_data="cap_prefix"), InlineKeyboardButton("🔠 Set Suffix", callback_data="cap_suffix")],
-            [InlineKeyboardButton("🧹 Clear All Rules", callback_data="cap_clear")],
-            [InlineKeyboardButton("🔙 Back to Main", callback_data="back_settings")]
+            [InlineKeyboardButton("🔡 Set Prefix", callback_data="cap_prefix"), InlineKeyboardButton("🔠 Set Suffix", callback_data="cap_suffix")]
         ]
+        
+        del_btns = []
+        if rules.get('prefix'): del_btns.append(InlineKeyboardButton("🗑 Del Prefix", callback_data="cap_del_prefix"))
+        if rules.get('suffix'): del_btns.append(InlineKeyboardButton("🗑 Del Suffix", callback_data="cap_del_suffix"))
+        if del_btns: kb.append(del_btns)
+        
+        kb.append([InlineKeyboardButton("🧹 Clear All Rules", callback_data="cap_clear")])
+        kb.append([InlineKeyboardButton("🔙 Back to Main", callback_data="back_settings")])
         await edit_or_reply(callback.message, text, InlineKeyboardMarkup(kb))
 
     elif action == "cap_rem_menu":
@@ -141,7 +147,7 @@ async def caption_settings_handler(client, callback: CallbackQuery):
         
         kb = [
             [InlineKeyboardButton("➕ Add Word to Remove", callback_data="cap_add_rem")],
-            [InlineKeyboardButton("🗑 Delele Word", callback_data="cap_del_rem")],
+            [InlineKeyboardButton("🗑 Delele Word", callback_data="cap_del_rem_menu")],
             [InlineKeyboardButton("🔙 Back", callback_data="cap_panel")]
         ]
         await edit_or_reply(callback.message, text, InlineKeyboardMarkup(kb))
@@ -156,7 +162,7 @@ async def caption_settings_handler(client, callback: CallbackQuery):
         
         kb = [
             [InlineKeyboardButton("➕ Add Replacement", callback_data="cap_add_rep")],
-            [InlineKeyboardButton("🗑 Delete Replacement", callback_data="cap_del_rep")],
+            [InlineKeyboardButton("🗑 Delete Replacement", callback_data="cap_del_rep_menu")],
             [InlineKeyboardButton("🔙 Back", callback_data="cap_panel")]
         ]
         await edit_or_reply(callback.message, text, InlineKeyboardMarkup(kb))
@@ -185,20 +191,71 @@ async def caption_settings_handler(client, callback: CallbackQuery):
         # Re-show panel
         await caption_settings_handler(client, callback)
         
-    # Delete Handlers... ideally need list select, but for simplicity:
-    elif action == "cap_del_rem":
-        # Just clear all for simple UI or ask for word?
-        # Let's clear removals for now to save complex UI work
-        rules["removals"] = []
-        await update_settings(user_id, caption_rules=rules)
-        await callback.answer("Removals cleared.", show_alert=True)
-        await caption_settings_handler(client, callback) # refresh
+    # Delete Handlers with Interactive Menus
+    elif action == "cap_del_rem_menu":
+        removals = rules.get("removals", [])
+        if not removals:
+            await callback.answer("❌ No words to delete!", show_alert=True)
+            return
+            
+        text = "🗑 **Select a Word/Phrase to Delete:**\n\n"
+        kb = []
+        for i, w in enumerate(removals):
+            lb = w if len(w) <= 30 else w[:27] + "..."
+            kb.append([InlineKeyboardButton(f"❌ {lb}", callback_data=f"cap_del_rem_idx_{i}")])
+        kb.append([InlineKeyboardButton("🔙 Back", callback_data="cap_rem_menu")])
+        await edit_or_reply(callback.message, text, InlineKeyboardMarkup(kb))
 
-    elif action == "cap_del_rep":
-        rules["replacements"] = {}
+    elif action.startswith("cap_del_rem_idx_"):
+        idx = int(action.split("_")[-1])
+        removals = rules.get("removals", [])
+        if 0 <= idx < len(removals):
+            removed = removals.pop(idx)
+            await update_settings(user_id, caption_rules=rules)
+            await callback.answer(f"🗑 Deleted: {removed}")
+        callback.data = "cap_del_rem_menu"
+        await caption_settings_handler(client, callback)
+
+    elif action == "cap_del_rep_menu":
+        reps = rules.get("replacements", {})
+        if not reps:
+            await callback.answer("❌ No replacements to delete!", show_alert=True)
+            return
+            
+        text = "🗑 **Select a Replacement Rule to Delete:**\n\n"
+        kb = []
+        for i, (old, new) in enumerate(reps.items()):
+            label = f"{old} ➡️ {new}"
+            if len(label) > 30: label = label[:27] + "..."
+            kb.append([InlineKeyboardButton(f"❌ {label}", callback_data=f"cap_del_rep_idx_{i}")])
+        kb.append([InlineKeyboardButton("🔙 Back", callback_data="cap_rep_menu")])
+        await edit_or_reply(callback.message, text, InlineKeyboardMarkup(kb))
+
+    elif action.startswith("cap_del_rep_idx_"):
+        idx = int(action.split("_")[-1])
+        reps = rules.get("replacements", {})
+        keys = list(reps.keys())
+        if 0 <= idx < len(keys):
+            removed_key = keys[idx]
+            del reps[removed_key]
+            await update_settings(user_id, caption_rules=rules)
+            await callback.answer(f"🗑 Deleted Rule for: {removed_key}")
+        callback.data = "cap_del_rep_menu"
+        await caption_settings_handler(client, callback)
+        
+    elif action == "cap_del_prefix":
+        rules["prefix"] = ""
         await update_settings(user_id, caption_rules=rules)
-        await callback.answer("Replacements cleared.", show_alert=True)
-        await caption_settings_handler(client, callback) # refresh
+        await callback.answer("Prefix deleted.", show_alert=True)
+        callback.data = "cap_panel"
+        await caption_settings_handler(client, callback)
+        
+    elif action == "cap_del_suffix":
+        rules["suffix"] = ""
+        await update_settings(user_id, caption_rules=rules)
+        await callback.answer("Suffix deleted.", show_alert=True)
+        callback.data = "cap_panel"
+        await caption_settings_handler(client, callback)
 
 
 @Client.on_callback_query(filters.regex("^set_channels"))
