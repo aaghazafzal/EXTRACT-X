@@ -249,14 +249,18 @@ async def delete_live_monitor(user_id, source_channel=None):
         await database.live_monitors.delete_many({"user_id": user_id})
 
 async def get_live_monitors(user_id):
-    """Get all live monitors for a user"""
+    """Get all live monitors for a user with stats"""
     database = await get_db()
     monitors = []
     async for doc in database.live_monitors.find({"user_id": user_id}):
         monitors.append({
             "source": doc["source_channel"],
             "dest": doc["dest_channel"],
-            "active": doc.get("active", True)
+            "active": doc.get("active", True),
+            "msg_count": doc.get("msg_count", 0),
+            "last_seen": doc.get("last_seen", 0),
+            "source_title": doc.get("source_title", ""),
+            "silent": doc.get("silent", False),
         })
     return monitors
 
@@ -278,6 +282,23 @@ async def toggle_live_monitor(user_id, source_channel, active):
     await database.live_monitors.update_one(
         {"user_id": user_id, "source_channel": source_channel},
         {"$set": {"active": active}}
+    )
+
+async def increment_live_stats(user_id, source_channel):
+    """Increment message count for a live monitor."""
+    import time as _time
+    database = await get_db()
+    await database.live_monitors.update_one(
+        {"user_id": user_id, "source_channel": source_channel},
+        {"$inc": {"msg_count": 1}, "$set": {"last_seen": _time.time()}}
+    )
+
+async def update_live_monitor_meta(user_id, source_channel, **kwargs):
+    """Update metadata for a live monitor (title, silent, etc)"""
+    database = await get_db()
+    await database.live_monitors.update_one(
+        {"user_id": user_id, "source_channel": source_channel},
+        {"$set": kwargs}
     )
 
 async def get_all_user_ids():
