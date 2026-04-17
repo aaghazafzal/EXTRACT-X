@@ -8,6 +8,12 @@ except RuntimeError:
 
 from pyrogram import Client, filters, idle
 from pyrogram.types import BotCommand, InlineKeyboardMarkup, InlineKeyboardButton
+
+# Pyrogram 2.0.106 Patch: Fix "Peer id invalid" for strictly newer 14-digit channel IDs (-10033...)
+import pyrogram.utils
+pyrogram.utils.MIN_CHANNEL_ID = -100999999999999
+pyrogram.utils.MIN_CHAT_ID = -9999999999999
+
 from config import API_ID, API_HASH, BOT_TOKEN
 import os
 from aiohttp import web
