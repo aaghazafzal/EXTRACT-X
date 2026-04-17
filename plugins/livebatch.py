@@ -127,10 +127,11 @@ async def show_livebatch_menu(target, user_id, limit, is_edit=False):
             pending = prog.get("pending", 0)
             skip = prog.get("skipped", 0)
             silent_tag = " 🔇" if m.get("silent") else ""
-            task_alive = (user_id, str(m["source"])) in {
-                (k[0], k[1]) for k in [(u, str(s)) for u, s in live_tasks.keys() if u == user_id]
-            }
-            engine = "⚙️" if (user_id in live_tasks and m["source"] in live_tasks.get(user_id, {})) else "💤"
+            task_alive = False
+            if user_id in live_tasks and m["source"] in live_tasks[user_id]:
+                task = live_tasks[user_id][m["source"]]
+                task_alive = not task.done()
+            engine = "⚙️" if task_alive else "💤"
             text += (
                 f"**{idx}.** {icon}{silent_tag} {engine} **{title}**\n"
                 f"   ✅ `{fwd}` done  •  🕐 `{pending}` pending  •  ⏭ `{skip}` skipped\n"
