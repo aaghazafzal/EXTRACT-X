@@ -624,9 +624,16 @@ async def monitor_channel(client, user_id, source_channel, dest_channel, q: asyn
                 continue
 
             live_progress[prog_key]["pending"] = q.qsize()
-            await process_live_message(
-                userbot, client, user_id, source_channel, dest_channel, msg, prog_key
-            )
+            try:
+                await process_live_message(
+                    userbot, client, user_id, source_channel, dest_channel, msg, prog_key
+                )
+            except FloodWait as fw:
+                logger.warning(f"Core FloodWait [{user_id}]: {fw.value}s restriction. Sleeping and re-queueing msg.")
+                await asyncio.sleep(fw.value + 2)
+                # Re-queue the message to ensure it is not skipped!
+                await q.put(msg)
+                
             q.task_done()
 
     except asyncio.CancelledError:
@@ -742,7 +749,16 @@ async def process_live_message(userbot, bot, user_id, source_channel, dest_chann
                             f"file_{msg.id}"
                     live_progress[prog_key]["current_file"] = fname
 
-                    f_path = await userbot.download_media(msg)
+                    try:
+                        f_path = await userbot.download_media(msg)
+                    except ValueError as ve:
+                        if "0 B" in str(ve):
+                            logger.warning(f"0B Error on live msg {msg.id}. Re-fetching.")
+                            fresh_msg = await userbot.get_messages(source_channel, msg.id)
+                            if fresh_msg and fresh_msg.media:
+                                f_path = await userbot.download_media(fresh_msg)
+                        else:
+                            raise ve
                     if f_path:
                         live_progress[prog_key]["downloaded_size"] = os.path.getsize(f_path)
 
@@ -806,6 +822,8 @@ async def process_live_message(userbot, bot, user_id, source_channel, dest_chann
 
     except asyncio.CancelledError:
         raise
+    except FloodWait as fw:
+        raise fw  # Bubble up to monitor_channel queue loop to sleep and retry
     except Exception as e:
         if prog_key in live_progress:
             live_progress[prog_key]["errors"] = live_progress[prog_key].get("errors", 0) + 1

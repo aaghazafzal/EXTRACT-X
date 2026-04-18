@@ -36,6 +36,35 @@ async def cancel_command(client, message):
     else:
         await message.reply_text("⚠️ No active batch process found.")
 
+@Client.on_callback_query(filters.regex(r"^cp_(pause|cancel)$"))
+async def copy_controls(client, callback):
+    user_id = callback.from_user.id
+    action = callback.data.split("_")[1]
+    
+    if user_id not in active_jobs:
+        await callback.answer("⚠️ No active task found.", show_alert=True)
+        return
+        
+    job = active_jobs[user_id]
+    
+    if action == "cancel":
+        job["cancel"] = True
+        await callback.answer("🛑 Cancelling Process...", show_alert=True)
+        try: await callback.message.edit_text("🛑 **Cancelling... Stopping Process.**")
+        except: pass
+    elif action == "pause":
+        is_paused = job.get("paused", False)
+        job["paused"] = not is_paused
+        status = "Paused" if job["paused"] else "Resumed"
+        await callback.answer(f"▶️ Task {status}!", show_alert=True)
+        # Update button text manually if possible
+        try:
+            kb = callback.message.reply_markup
+            if kb and kb.inline_keyboard:
+                kb.inline_keyboard[0][0].text = "▶️ Resume" if job["paused"] else "⏸ Pause"
+                await callback.message.edit_reply_markup(reply_markup=kb)
+        except: pass
+
 @Client.on_message(filters.command("batch") & filters.private)
 async def batch_start(client, message):
     if not await check_force_sub(client, message):
@@ -447,13 +476,29 @@ async def start_copy_job(bot, message, user_id, link, limit, dest_channels=None)
         fail_count = 0
         consecutive_empty_batches = 0
         last_update_time = time.time()
+        active_jobs[user_id]["paused"] = False
+        
+        # Helper to calculate speed
+        last_speed_calc = [time.time(), 0] # timestamp, bytes
+
+        def get_progress_bar(current, total, length=12):
+            if total <= 0: return "░" * length
+            percent = min(current / total, 1.0)
+            filled = int(length * percent)
+            bar = "▓" * filled + "░" * (length - filled)
+            return bar
         
         while True:
+            # Handle Pause
+            while active_jobs[user_id].get("paused", False):
+                await asyncio.sleep(1)
+                if active_jobs.get(user_id, {}).get("cancel"): break
+
             try: userbot.sleep_threshold = 5
             except: pass
             
             # 1. Global Checks
-            if active_jobs[user_id]["cancel"]: break
+            if active_jobs.get(user_id, {}).get("cancel"): break
             # Stop if we passed the user's limit
             if limit and copied >= limit: break
             # Stop if we passed the requested range OR the channel end
@@ -545,17 +590,43 @@ async def start_copy_job(bot, message, user_id, link, limit, dest_channels=None)
                         async def progress(current, total):
                             now = time.time()
                             if (now - last_update[0]) > 4:
-                                percent = (current / total) * 100 if total else 0
+                                percent_overall = int((copied / total_workload) * 100) if total_workload > 0 else 0
+                                bar_overall = get_progress_bar(copied, total_workload, length=12)
+                                
+                                percent_file = (current / total) * 100 if total > 0 else 0
+                                p_bar = get_progress_bar(current, total, length=10)
                                 curr_mb = current / (1024 * 1024)
-                                tot_mb = total / (1024 * 1024) if total else 0
+                                tot_mb = total / (1024 * 1024) if total > 0 else 0
+                                
+                                # Calc speed
+                                elapsed = now - last_speed_calc[0]
+                                diff_bytes = current - last_speed_calc[1]
+                                speed_mb_s = (diff_bytes / elapsed) / (1024 * 1024) if elapsed > 0 else 0
+                                last_speed_calc[0] = now
+                                last_speed_calc[1] = current
+                                
+                                text = (
+                                    f"⚡ **EXTRACT X PROCESSOR** ⚡\n\n"
+                                    f"📥 **Processing:** `{copied} / {total_workload}`\n"
+                                    f"`{bar_overall}` **{percent_overall}%**\n\n"
+                                    f"🟢 **Status:** `Active (Restricted Mode)`\n"
+                                    f" **Source:** `{chat_title}`\n"
+                                    f"📁 **Current Filter:** {filter_str}\n\n"
+                                    f"⚙️ **Manual Extraction**\n"
+                                    f"🚀 **Action:** `{action_name}`\n"
+                                    f"📊 `{p_bar}` {percent_file:.1f}%\n"
+                                    f"📦 **Size:** `{curr_mb:.1f} MB` / `{tot_mb:.1f} MB`\n"
+                                    f"⚡ **Speed:** `{speed_mb_s:.1f} MB/s`\n\n"
+                                    f"_(Fast multi-target sync enabled)_"
+                                )
+                                kb = InlineKeyboardMarkup([
+                                    [
+                                        InlineKeyboardButton("⏸ Pause", callback_data="cp_pause"),
+                                        InlineKeyboardButton("❌ Cancel", callback_data="cp_cancel")
+                                    ]
+                                ])
                                 try:
-                                    await status_msg.edit_text(
-                                        f"⚙️ **Manual Extraction** ⚙️\n\n"
-                                        f"🚀 **Action:** `{action_name}`\n"
-                                        f"📊 **Progress:** `{percent:.1f}%`\n"
-                                        f"📦 **Size:** `{curr_mb:.1f} MB` / `{tot_mb:.1f} MB`\n\n"
-                                        f"_(Fast multi-target sync enabled)_"
-                                    )
+                                    await status_msg.edit_text(text, reply_markup=kb)
                                     last_update[0] = now
                                 except: pass
                         return progress
@@ -635,7 +706,17 @@ async def start_copy_job(bot, message, user_id, link, limit, dest_channels=None)
                                                 success = True
                                                 break
                                                 
-                                            f_path = await userbot.download_media(msg, progress=get_progress_func("Downloading from Source"))
+                                            # Wrap download in try/except to mitigate 'File size equals to 0 B' bug
+                                            try:
+                                                f_path = await userbot.download_media(msg, progress=get_progress_func("Downloading from Source"))
+                                            except ValueError as ve:
+                                                if "0 B" in str(ve):
+                                                    logger.warning(f"0B Error on msg {msg.id}. Re-fetching message reference.")
+                                                    fresh_msg = await userbot.get_messages(real_chat_id, msg.id)
+                                                    if fresh_msg and fresh_msg.media:
+                                                        f_path = await userbot.download_media(fresh_msg, progress=get_progress_func("Downloading from Source"))
+                                                else:
+                                                    raise ve
                                             
                                             try:
                                                 # Upload based on type
@@ -742,14 +823,21 @@ async def start_copy_job(bot, message, user_id, link, limit, dest_channels=None)
                         bar = get_progress_bar(copied, total_workload, length=12)
                         
                         try:
+                            status_str = "⏸ Paused" if active_jobs.get(user_id, {}).get("paused") else "Active & Copying..."
                             await status_msg.edit_text(
                                 f"⚡ **EXTRACT X PROCESSOR** ⚡\n\n"
-                                f"📥 **Processing:** `{copied}` / `{total_workload}`\n"
+                                f"📥 **Processing:** `{copied} / {total_workload}`\n"
                                 f"`{bar}` **{percent}%**\n\n"
-                                f"🟢 **Status:** `Active & Copying...`\n"
+                                f"🟢 **Status:** `{status_str}`\n"
                                 f" **Source:** `{chat_title}`\n"
                                 f"📁 **Current Filter:** {filter_str}\n\n"
-                                f"_* Press /cancel to stop immediately._"
+                                f"_* Press /cancel to stop immediately._",
+                                reply_markup=InlineKeyboardMarkup([
+                                    [
+                                        InlineKeyboardButton("▶️ Resume" if active_jobs.get(user_id, {}).get("paused") else "⏸ Pause", callback_data="cp_pause"),
+                                        InlineKeyboardButton("❌ Cancel", callback_data="cp_cancel")
+                                    ]
+                                ])
                             )
                         except FloodWait as e:
                             logger.warning(f"UI FloodWait: {e.value}s - Skipping update")
