@@ -257,6 +257,12 @@ async def livebatch_callback_handler(client, callback):
         await show_livebatch_menu(callback.message, user_id, limit, is_edit=True)
         await callback.answer("Cancelled.")
 
+    # ── DEST PICKER (must be here — the ^live_ regex catches it before the
+    #    standalone handler can fire, so we route it explicitly) ──
+    elif action == "live_open_dest_picker":
+        await _handle_live_open_dest_picker(client, callback)
+        return
+
     # ── PER-MONITOR STATS ──
     elif action.startswith("live_mon_stat_"):
         source_str = action[len("live_mon_stat_"):]
@@ -515,8 +521,9 @@ async def handle_livebatch_input(client, message):
     return False
 
 # ── Open destination picker for livebatch ──────────────────────────────
-@Client.on_callback_query(filters.regex("^live_open_dest_picker$"))
-async def live_open_dest_picker(client, callback):
+# NOTE: NOT decorated — routed via livebatch_callback_handler to avoid
+# the ^live_ regex consuming it before this handler can fire.
+async def _handle_live_open_dest_picker(client, callback):
     user_id = callback.from_user.id
     state = livebatch_states.get(user_id)
     if not state or state.get("step") != "DEST":
