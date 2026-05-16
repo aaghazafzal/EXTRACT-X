@@ -322,6 +322,7 @@ async def get_live_monitors(user_id):
             "last_seen": doc.get("last_seen", 0),
             "source_title": doc.get("source_title", ""),
             "silent": doc.get("silent", False),
+            "filters": doc.get("filters", None),  # None = use global settings
         })
     return monitors
 

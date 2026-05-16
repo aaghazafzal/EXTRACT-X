@@ -31,7 +31,8 @@ MAX_DL_SIZE = 2 * 1024 * 1024 * 1024  # 2 GB limit for DL+Upload
 live_tasks   = {}      # (user_id, source) → asyncio.Task (queue processor)
 live_queues  = {}      # (user_id, source) → asyncio.Queue
 live_progress = {}     # (user_id, source) → progress_dict
-livebatch_states = {}  # user_id → setup step dict
+livebatch_states = {}      # user_id → setup step dict
+live_filter_edit_state = {}  # user_id → {"source": id, "filters": {...}}
 
 # ══════════════════════════════════════════════════
 # HELPERS
@@ -82,6 +83,76 @@ async def get_monitor_limit(user_id):
     return plan["live_monitor_limit"]
 
 def progress_key(user_id, source): return (user_id, str(source))
+
+# ── Per-monitor filter helpers ──────────────────────────────────
+_FILTER_PAIRS = [
+    ("photo",    "🖼 Photos"),
+    ("video",    "📹 Videos"),
+    ("document", "📂 Files"),
+    ("audio",    "🎵 Audio"),
+    ("text",     "📝 Text"),
+    ("media",    "📱 Any Media"),
+]
+
+def _toggle_filter(filters: dict, key: str) -> dict:
+    f = dict(filters)
+    if key == "all":
+        f["all"] = not f.get("all", False)
+        if f["all"]:
+            for k in ["photo","video","document","audio","text","media"]:
+                f[k] = False
+    else:
+        f[key] = not f.get(key, False)
+        if f[key]:          # turning ON a specific type → disable "all"
+            f["all"] = False
+    return f
+
+def _get_filter_label(filters: dict) -> str:
+    if not filters or filters.get("all"):
+        return "📋 All Content"
+    parts = []
+    for key, label in _FILTER_PAIRS:
+        if filters.get(key): parts.append(label)
+    return " | ".join(parts) if parts else "📋 All Content"
+
+def _build_filter_text(source_title: str = "", is_edit: bool = False) -> str:
+    step = "Edit" if is_edit else "Step 3/3 — Set"
+    src  = f"📡 **Monitor:** `{source_title}`\n\n" if source_title else ""
+    return (
+        f"🔍 **{step} Filters**\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"{src}"
+        "Choose which content to forward:\n"
+        "• **All Content** — forward everything (default)\n"
+        "• Turn **All** OFF, then pick specific types\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "💡 _Takes effect on all future messages._"
+    )
+
+def _build_filter_kb(filters: dict, confirm_cb: str,
+                     tog_prefix: str = "live_ftog_",
+                     back_cb: str = None) -> InlineKeyboardMarkup:
+    tick = "✅"; cross = "❌"
+    is_all = filters.get("all", False)
+    rows = [[
+        InlineKeyboardButton(
+            f"{tick if is_all else cross} 📋 All Content",
+            callback_data=f"{tog_prefix}all"
+        )
+    ]]
+    for i in range(0, len(_FILTER_PAIRS), 2):
+        row = []
+        for key, label in _FILTER_PAIRS[i:i+2]:
+            active = is_all or filters.get(key, False)
+            row.append(InlineKeyboardButton(
+                f"{'\u2705' if active else '\u274c'} {label}",
+                callback_data=f"{tog_prefix}{key}"
+            ))
+        rows.append(row)
+    rows.append([InlineKeyboardButton("✅ Save Filters", callback_data=confirm_cb)])
+    if back_cb:
+        rows.append([InlineKeyboardButton("⬅️ Back", callback_data=back_cb)])
+    return InlineKeyboardMarkup(rows)
 
 def init_progress(user_id, source):
     key = progress_key(user_id, source)
@@ -263,6 +334,104 @@ async def livebatch_callback_handler(client, callback):
         await _handle_live_open_dest_picker(client, callback)
         return
 
+    # ── FILTER SETUP (step 3 of new monitor setup) ──
+    elif action.startswith("live_ftog_"):
+        key   = action[len("live_ftog_"):]
+        state = livebatch_states.get(user_id, {})
+        if state.get("step") != "FILTERS":
+            await callback.answer("Session expired. Run /livebatch again.", show_alert=True)
+            return
+        state["filters"] = _toggle_filter(state.get("filters", {"all": True}), key)
+        kb   = _build_filter_kb(state["filters"], "live_fconfirm")
+        text = _build_filter_text(state.get("source_title", ""))
+        try: await callback.message.edit_text(text, reply_markup=kb)
+        except: pass
+        await callback.answer()
+
+    elif action == "live_fconfirm":
+        state = livebatch_states.pop(user_id, {})
+        if state.get("step") != "FILTERS":
+            await callback.answer("Session expired.", show_alert=True)
+            return
+        source_id    = state["source"]
+        source_title = state.get("source_title", str(source_id))
+        dests        = state.get("dests", [])
+        filters      = state.get("filters", {"all": True})
+        for dest in dests:
+            await save_live_monitor(user_id, source_id, dest)
+            await update_live_monitor_meta(user_id, source_id, source_title=source_title, filters=filters)
+            await start_monitor_task(client, user_id, source_id, dest)
+        dest_list   = "\n".join(f"  • `{d}`" for d in dests)
+        filter_disp = _get_filter_label(filters)
+        try:
+            await callback.message.edit_text(
+                "╬══════════════════════╬\n"
+                "║  📡  MONITORS ACTIVE!  ║\n"
+                "╚══════════════════════╝\n\n"
+                f"📡 **Source:** `{source_title}`\n"
+                f"📬 **Destinations ({len(dests)}):**\n{dest_list}\n"
+                f"🔍 **Filters:** {filter_disp}\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                "⚡ Every new post auto-forwarded!\n"
+                "Use /livebatch → 📊 for stats.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📡 Manage Monitors", callback_data="live_refresh")]
+                ])
+            )
+        except: pass
+        await callback.answer("✅ Monitor started!")
+
+    # ── FILTER EDIT (for existing monitors) ──
+    elif action.startswith("live_editfilter_"):
+        source_str = action[len("live_editfilter_"):]
+        try: source = int(source_str)
+        except: source = source_str
+        monitors = await get_live_monitors(user_id)
+        m = next((x for x in monitors if str(x["source"]) == str(source)), None)
+        if not m:
+            await callback.answer("Monitor not found!", show_alert=True)
+            return
+        cur_filters = m.get("filters") or {"all": True}
+        live_filter_edit_state[user_id] = {"source": source, "filters": dict(cur_filters)}
+        source_title = m.get("source_title", str(source))
+        text = _build_filter_text(source_title, is_edit=True)
+        kb   = _build_filter_kb(cur_filters, "live_efconfirm",
+                                tog_prefix="live_eftog_",
+                                back_cb=f"live_mon_stat_{source}")
+        try: await callback.message.edit_text(text, reply_markup=kb)
+        except: pass
+        await callback.answer()
+
+    elif action.startswith("live_eftog_"):
+        key        = action[len("live_eftog_"):]
+        edit_state = live_filter_edit_state.get(user_id)
+        if not edit_state:
+            await callback.answer("Session expired.", show_alert=True)
+            return
+        edit_state["filters"] = _toggle_filter(edit_state["filters"], key)
+        source = edit_state["source"]
+        monitors = await get_live_monitors(user_id)
+        m = next((x for x in monitors if str(x["source"]) == str(source)), None)
+        source_title = m.get("source_title", str(source)) if m else str(source)
+        text = _build_filter_text(source_title, is_edit=True)
+        kb   = _build_filter_kb(edit_state["filters"], "live_efconfirm",
+                                tog_prefix="live_eftog_",
+                                back_cb=f"live_mon_stat_{source}")
+        try: await callback.message.edit_text(text, reply_markup=kb)
+        except: pass
+        await callback.answer()
+
+    elif action == "live_efconfirm":
+        edit_state = live_filter_edit_state.pop(user_id, None)
+        if not edit_state:
+            await callback.answer("Session expired.", show_alert=True)
+            return
+        source  = edit_state["source"]
+        filters = edit_state["filters"]
+        await update_live_monitor_meta(user_id, source, filters=filters)
+        await callback.answer(f"✅ Filters saved: {_get_filter_label(filters)}", show_alert=True)
+        await show_livebatch_menu(callback.message, user_id, limit, is_edit=True)
+
     # ── PER-MONITOR STATS ──
     elif action.startswith("live_mon_stat_"):
         source_str = action[len("live_mon_stat_"):]
@@ -329,11 +498,14 @@ async def livebatch_callback_handler(client, callback):
             f"⚡ **Current Method:** `{method}`\n"
             f"🕒 **Last Message:** `{last_active}`\n"
             f"⏱ **Runtime:** `{runtime}`"
-            f"{dl_bar}"
+            f"{dl_bar}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔍 **Filters:** {_get_filter_label(m.get('filters'))}"
         )
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔄 Refresh Stats", callback_data=f"live_mon_stat_{source}")],
-            [InlineKeyboardButton("⬅️ Back to Hub", callback_data="live_refresh")],
+            [InlineKeyboardButton("🔄 Refresh Stats",    callback_data=f"live_mon_stat_{source}")],
+            [InlineKeyboardButton("🔍 Edit Filters",     callback_data=f"live_editfilter_{source}")],
+            [InlineKeyboardButton("⬅️ Back to Hub",     callback_data="live_refresh")],
         ])
         try:
             await callback.message.edit_text(text, reply_markup=kb)
@@ -545,31 +717,16 @@ async def _handle_live_open_dest_picker(client, callback):
             except: pass
             return
 
-        # Save one monitor per selected destination
-        for dest in selected_channels:
-            await save_live_monitor(uid, source_id, dest)
-            await update_live_monitor_meta(uid, source_id, source_title=source_title)
-            await start_monitor_task(cl, uid, source_id, dest)
+        # Transition to FILTERS step (step 3/3) — do NOT save yet
+        s["step"]    = "FILTERS"
+        s["dests"]   = selected_channels
+        s["filters"] = {"all": True}   # sensible default
+        livebatch_states[uid] = s
 
-        livebatch_states.pop(uid, None)
-
-        dest_list = "\n".join(f"  • `{d}`" for d in selected_channels)
+        text = _build_filter_text(source_title)
+        kb   = _build_filter_kb(s["filters"], "live_fconfirm")
         try:
-            await cb.message.edit_text(
-                "╔══════════════════════╗\n"
-                "║  📡  MONITORS ACTIVE!  ║\n"
-                "╚══════════════════════╝\n\n"
-                f"📡 **Source:** `{source_title}`\n"
-                f"📤 **Destinations ({len(selected_channels)}):**\n{dest_list}\n\n"
-                "━━━━━━━━━━━━━━━━━━━━━━\n"
-                "⚡ Every new post auto-forwarded to ALL selected channels!\n"
-                "• Restricted? DL+Upload (max 2 GB)\n"
-                "• Queue system — nothing ever missed!\n\n"
-                "Use /livebatch → 📊 for real-time stats!",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📡 Manage Monitors", callback_data="live_refresh")]
-                ])
-            )
+            await cb.message.edit_text(text, reply_markup=kb)
         except: pass
 
     await open_channel_picker(
@@ -664,14 +821,16 @@ async def process_live_message(userbot, bot, user_id, source_channel, dest_chann
     """Process a single queued message."""
     try:
         settings = await get_settings(user_id) or {}
-        filters_cfg = settings.get("filters", {"all": True})
-        caption_rules = settings.get("caption_rules", {})
-        text_clean    = settings.get("text_clean", {})
+        caption_rules   = settings.get("caption_rules", {})
+        text_clean      = settings.get("text_clean", {})
         custom_thumb_id = settings.get("custom_thumbnail")
 
         monitors = await get_live_monitors(user_id)
-        mon_cfg = next((m for m in monitors if str(m["source"]) == str(source_channel)), {})
-        silent = mon_cfg.get("silent", False)
+        mon_cfg  = next((m for m in monitors if str(m["source"]) == str(source_channel)), {})
+        silent   = mon_cfg.get("silent", False)
+
+        # Per-monitor filters (fallback to global settings)
+        filters_cfg = mon_cfg.get("filters") or settings.get("filters", {"all": True})
 
         # ── Filter check ──
         ok = False
