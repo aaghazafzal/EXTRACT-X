@@ -286,13 +286,15 @@ async def is_protected_channel(channel_id):
 
 # --- LIVE BATCH MONITORS ---
 
-async def save_live_monitor(user_id, source_channel, dest_channel):
-    """Save a live monitoring configuration"""
+async def save_live_monitor(user_id, source_channel, dest_channels):
+    """Save a live monitoring configuration (supports multiple destinations)"""
     database = await get_db()
+    if not isinstance(dest_channels, list):
+        dest_channels = [dest_channels]
     await database.live_monitors.update_one(
         {"user_id": user_id, "source_channel": source_channel},
         {"$set": {
-            "dest_channel": dest_channel,
+            "dest_channels": dest_channels,
             "active": True
         }},
         upsert=True
@@ -316,7 +318,9 @@ async def get_live_monitors(user_id):
     async for doc in database.live_monitors.find({"user_id": user_id}):
         monitors.append({
             "source": doc["source_channel"],
-            "dest": doc["dest_channel"],
+            # Backwards compat: old docs use dest_channel; new docs use dest_channels list
+            "dest": doc.get("dest_channels") or
+                    ([doc["dest_channel"]] if doc.get("dest_channel") else []),
             "active": doc.get("active", True),
             "msg_count": doc.get("msg_count", 0),
             "last_seen": doc.get("last_seen", 0),
@@ -334,7 +338,8 @@ async def get_all_live_monitors():
         monitors.append({
             "user_id": doc["user_id"],
             "source": doc["source_channel"],
-            "dest": doc["dest_channel"]
+            "dest": doc.get("dest_channels") or
+                    ([doc["dest_channel"]] if doc.get("dest_channel") else []),
         })
     return monitors
 

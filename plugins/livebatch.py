@@ -357,10 +357,10 @@ async def livebatch_callback_handler(client, callback):
         source_title = state.get("source_title", str(source_id))
         dests        = state.get("dests", [])
         filters      = state.get("filters", {"all": True})
-        for dest in dests:
-            await save_live_monitor(user_id, source_id, dest)
-            await update_live_monitor_meta(user_id, source_id, source_title=source_title, filters=filters)
-            await start_monitor_task(client, user_id, source_id, dest)
+        # Save ALL dests in ONE monitor document, start ONE task
+        await save_live_monitor(user_id, source_id, dests)
+        await update_live_monitor_meta(user_id, source_id, source_title=source_title, filters=filters)
+        await start_monitor_task(client, user_id, source_id, dests)
         dest_list   = "\n".join(f"  • `{d}`" for d in dests)
         filter_disp = _get_filter_label(filters)
         try:
@@ -484,7 +484,7 @@ async def livebatch_callback_handler(client, callback):
             f"╚══════════════════════╝\n\n"
             f"📡 **Channel:** `{title}`\n"
             f"🆔 **Source ID:** `{source}`\n"
-            f"📤 **Destination:** `{m['dest']}`\n"
+            f"📤 **Destinations:** `{len(m['dest'])}` channel(s)\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🔋 **Status:** {status}\n"
             f"⚙️ **Engine:** {engine_status}\n"
@@ -741,7 +741,9 @@ async def _handle_live_open_dest_picker(client, callback):
 # ══════════════════════════════════════════════════
 # MONITOR TASK ENGINE (Queue-based)
 # ══════════════════════════════════════════════════
-async def start_monitor_task(client, user_id, source_channel, dest_channel):
+async def start_monitor_task(client, user_id, source_channel, dest_channels):
+    if not isinstance(dest_channels, list):
+        dest_channels = [dest_channels]
     if user_id not in live_tasks:
         live_tasks[user_id] = {}
     if source_channel in live_tasks[user_id]:
@@ -752,12 +754,12 @@ async def start_monitor_task(client, user_id, source_channel, dest_channel):
     key = init_progress(user_id, source_channel)
 
     task = asyncio.create_task(
-        monitor_channel(client, user_id, source_channel, dest_channel, q, key)
+        monitor_channel(client, user_id, source_channel, dest_channels, q, key)
     )
     live_tasks[user_id][source_channel] = task
-    logger.info(f"Started live monitor: User {user_id}, Source {source_channel}")
+    logger.info(f"Started live monitor: User {user_id}, Source {source_channel}, Dests {len(dest_channels)}")
 
-async def monitor_channel(client, user_id, source_channel, dest_channel, q: asyncio.Queue, prog_key):
+async def monitor_channel(client, user_id, source_channel, dest_channels, q: asyncio.Queue, prog_key):
     """Runs userbot, enqueues messages, processes them one by one."""
     userbot = None
     try:
@@ -791,7 +793,7 @@ async def monitor_channel(client, user_id, source_channel, dest_channel, q: asyn
             live_progress[prog_key]["pending"] = q.qsize()
             try:
                 await process_live_message(
-                    userbot, client, user_id, source_channel, dest_channel, msg, prog_key
+                    userbot, client, user_id, source_channel, dest_channels, msg, prog_key
                 )
             except FloodWait as fw:
                 logger.warning(f"Core FloodWait [{user_id}]: {fw.value}s restriction. Sleeping and re-queueing msg.")
@@ -817,8 +819,10 @@ async def monitor_channel(client, user_id, source_channel, dest_channel, q: asyn
             try: await userbot.stop()
             except: pass
 
-async def process_live_message(userbot, bot, user_id, source_channel, dest_channel, msg, prog_key):
-    """Process a single queued message."""
+async def process_live_message(userbot, bot, user_id, source_channel, dest_channels, msg, prog_key):
+    """Process a single queued message — forwards to ALL dest channels."""
+    if not isinstance(dest_channels, list):
+        dest_channels = [dest_channels]
     try:
         settings = await get_settings(user_id) or {}
         caption_rules   = settings.get("caption_rules", {})
@@ -866,28 +870,23 @@ async def process_live_message(userbot, bot, user_id, source_channel, dest_chann
         if p: cap = f"{p}\n{cap}" if cap else p
         if s: cap = f"{cap}\n{s}" if cap else s
         if caption_rules.get("remove_caption"): cap = ""
-
-        # Apply Text Cleaning rules (username/link/hashtag/phone/url removers)
-        # caption_rules is passed so prefix/suffix/replacements are never cleaned
         if cap and text_clean:
             cap = apply_text_clean(cap, text_clean, caption_rules)
 
-        # ── Dest id ──
-        try: d_id = int(dest_channel) if str(dest_channel).lstrip("-").isdigit() else dest_channel
-        except: d_id = dest_channel
+        # ── Resolve dest IDs ──
+        dest_ids = []
+        for dc in dest_channels:
+            try: dest_ids.append(int(dc) if str(dc).lstrip("-").isdigit() else dc)
+            except: dest_ids.append(dc)
 
-        # ── Try fast copy first ──
+        # ── Try fast copy to ALL dests ──
         live_progress[prog_key]["method"] = "fast_copy"
         forwarded = False
-        try:
-            await userbot.copy_message(
-                chat_id=d_id, from_chat_id=source_channel,
-                message_id=msg.id, caption=cap or None,
-                disable_notification=silent
-            )
-            forwarded = True
-        except FloodWait as fw:
-            await asyncio.sleep(fw.value + 2)
+        needs_dl  = False   # becomes True if source is forward-restricted
+
+        for d_id in dest_ids:
+            if needs_dl:
+                break   # source is restricted — no point trying more copies
             try:
                 await userbot.copy_message(
                     chat_id=d_id, from_chat_id=source_channel,
@@ -895,117 +894,136 @@ async def process_live_message(userbot, bot, user_id, source_channel, dest_chann
                     disable_notification=silent
                 )
                 forwarded = True
-            except: pass
-        except Exception as e:
-            err = str(e)
-            if not any(x in err for x in ["FORWARDS_RESTRICTED", "restricted", "FORWARD"]):
-                live_progress[prog_key]["errors"] = live_progress[prog_key].get("errors", 0) + 1
-                return
+            except FloodWait as fw:
+                await asyncio.sleep(fw.value + 2)
+                try:
+                    await userbot.copy_message(
+                        chat_id=d_id, from_chat_id=source_channel,
+                        message_id=msg.id, caption=cap or None,
+                        disable_notification=silent
+                    )
+                    forwarded = True
+                except Exception:
+                    needs_dl = True
+            except Exception as e:
+                err = str(e)
+                if any(x in err for x in ["FORWARDS_RESTRICTED", "restricted", "FORWARD"]):
+                    needs_dl = True
+                else:
+                    live_progress[prog_key]["errors"] = live_progress[prog_key].get("errors", 0) + 1
 
-        # ── DL+Upload fallback ──
-        if not forwarded:
+        # ── DL+Upload fallback (download ONCE, send to all restricted dests) ──
+        if needs_dl:
             live_progress[prog_key]["method"] = "dl_upload"
             file_size = get_file_size(msg)
 
-            # 2 GB size check
             if file_size > MAX_DL_SIZE:
                 live_progress[prog_key]["skipped"] = live_progress[prog_key].get("skipped", 0) + 1
-                live_progress[prog_key]["current_file"] = f"⏭ Skipped: {fmt_size(file_size)} > 2GB"
+                live_progress[prog_key]["current_file"] = f"⏭ Skipped: {fmt_size(file_size)} >2GB"
                 logger.info(f"Skipped large file: {fmt_size(file_size)} [{user_id}/{source_channel}]")
-                return
-
-            live_progress[prog_key]["current_size"] = file_size
-            live_progress[prog_key]["downloaded_size"] = 0
-
-            f_path = None
-            thumb_path = None
-            try:
-                if msg.text:
-                    await userbot.send_message(d_id, cap or msg.text, disable_notification=silent)
-                    forwarded = True
-                elif msg.media:
-                    fname = getattr(getattr(msg, "document", None), "file_name", None) or \
-                            getattr(getattr(msg, "video", None), "file_name", None) or \
-                            f"file_{msg.id}"
-                    live_progress[prog_key]["current_file"] = fname
-
-                    try:
-                        f_path = await userbot.download_media(msg)
-                    except ValueError as ve:
-                        if "0 B" in str(ve):
-                            logger.warning(f"0B Error on live msg {msg.id}. Re-fetching.")
-                            await asyncio.sleep(2)
-                            fresh_msg = await userbot.get_messages(source_channel, msg.id)
-                            if fresh_msg and fresh_msg.media:
-                                try:
-                                    f_path = await userbot.download_media(fresh_msg)
-                                except ValueError as double_ve:
-                                    if "0 B" in str(double_ve):
-                                        logger.warning("Double 0B err! FloodWait blocking LiveBatch download stream.")
-                                        raise ValueError("FLOOD_WAIT_0B")
-                                    raise double_ve
-                        else:
-                            raise ve
-                    if f_path:
-                        live_progress[prog_key]["downloaded_size"] = os.path.getsize(f_path)
-
-                    if not f_path:
-                        live_progress[prog_key]["errors"] = live_progress[prog_key].get("errors", 0) + 1
-                        return
-
-                    # Thumbnail
-                    if custom_thumb_id:
-                        try: thumb_path = await bot.download_media(custom_thumb_id)
-                        except: pass
-                    elif msg.video and msg.video.thumbs:
-                        try: thumb_path = await userbot.download_media(msg.video.thumbs[0].file_id)
-                        except: pass
-
-                    kw = {"disable_notification": silent}
-                    if msg.photo:
-                        await userbot.send_photo(d_id, f_path, caption=cap or None, **kw)
-                    elif msg.video:
-                        await userbot.send_video(
-                            d_id, f_path, caption=cap or None,
-                            duration=msg.video.duration,
-                            width=msg.video.width, height=msg.video.height,
-                            thumb=thumb_path, **kw
-                        )
-                    elif msg.document:
-                        await userbot.send_document(d_id, f_path, caption=cap or None, force_document=True, **kw)
-                    elif msg.audio:
-                        await userbot.send_audio(
-                            d_id, f_path, caption=cap or None,
-                            duration=msg.audio.duration,
-                            performer=msg.audio.performer,
-                            title=msg.audio.title, **kw
-                        )
-                    elif msg.voice:
-                        await userbot.send_voice(d_id, f_path, caption=cap or None,
-                                                  duration=msg.voice.duration, **kw)
-                    elif msg.animation:
-                        await userbot.send_animation(d_id, f_path, caption=cap or None, **kw)
-                    elif msg.sticker:
-                        await userbot.send_sticker(d_id, f_path, **kw)
-                    else:
-                        await userbot.send_document(d_id, f_path, caption=cap or None, **kw)
-                    forwarded = True
-            finally:
-                live_progress[prog_key]["current_file"] = ""
-                live_progress[prog_key]["current_size"] = 0
+            else:
+                live_progress[prog_key]["current_size"] = file_size
                 live_progress[prog_key]["downloaded_size"] = 0
-                live_progress[prog_key]["method"] = "idle"
-                for pp in [f_path, thumb_path]:
-                    if pp and os.path.exists(pp):
-                        try: os.remove(pp)
-                        except: pass
+
+                f_path = None
+                thumb_path = None
+                try:
+                    if msg.text:
+                        for d_id in dest_ids:
+                            try:
+                                await userbot.send_message(d_id, cap or msg.text, disable_notification=silent)
+                                forwarded = True
+                            except Exception as e:
+                                live_progress[prog_key]["errors"] = live_progress[prog_key].get("errors", 0) + 1
+                    elif msg.media:
+                        fname = getattr(getattr(msg, "document", None), "file_name", None) or \
+                                getattr(getattr(msg, "video", None), "file_name", None) or \
+                                f"file_{msg.id}"
+                        live_progress[prog_key]["current_file"] = fname
+
+                        try:
+                            f_path = await userbot.download_media(msg)
+                        except ValueError as ve:
+                            if "0 B" in str(ve):
+                                logger.warning(f"0B Error on live msg {msg.id}. Re-fetching.")
+                                await asyncio.sleep(2)
+                                fresh_msg = await userbot.get_messages(source_channel, msg.id)
+                                if fresh_msg and fresh_msg.media:
+                                    try:
+                                        f_path = await userbot.download_media(fresh_msg)
+                                    except ValueError as double_ve:
+                                        if "0 B" in str(double_ve):
+                                            logger.warning("Double 0B err! FloodWait blocking LiveBatch download stream.")
+                                            raise ValueError("FLOOD_WAIT_0B")
+                                        raise double_ve
+                            else:
+                                raise ve
+
+                        if f_path:
+                            live_progress[prog_key]["downloaded_size"] = os.path.getsize(f_path)
+
+                        if not f_path:
+                            live_progress[prog_key]["errors"] = live_progress[prog_key].get("errors", 0) + 1
+                        else:
+                            # Thumbnail built once, reused for all dests
+                            if custom_thumb_id:
+                                try: thumb_path = await bot.download_media(custom_thumb_id)
+                                except: pass
+                            elif msg.video and msg.video.thumbs:
+                                try: thumb_path = await userbot.download_media(msg.video.thumbs[0].file_id)
+                                except: pass
+
+                            kw = {"disable_notification": silent}
+                            for d_id in dest_ids:
+                                try:
+                                    if msg.photo:
+                                        await userbot.send_photo(d_id, f_path, caption=cap or None, **kw)
+                                    elif msg.video:
+                                        await userbot.send_video(
+                                            d_id, f_path, caption=cap or None,
+                                            duration=msg.video.duration,
+                                            width=msg.video.width, height=msg.video.height,
+                                            thumb=thumb_path, **kw
+                                        )
+                                    elif msg.document:
+                                        await userbot.send_document(d_id, f_path, caption=cap or None, force_document=True, **kw)
+                                    elif msg.audio:
+                                        await userbot.send_audio(
+                                            d_id, f_path, caption=cap or None,
+                                            duration=msg.audio.duration,
+                                            performer=msg.audio.performer,
+                                            title=msg.audio.title, **kw
+                                        )
+                                    elif msg.voice:
+                                        await userbot.send_voice(d_id, f_path, caption=cap or None,
+                                                                  duration=msg.voice.duration, **kw)
+                                    elif msg.animation:
+                                        await userbot.send_animation(d_id, f_path, caption=cap or None, **kw)
+                                    elif msg.sticker:
+                                        await userbot.send_sticker(d_id, f_path, **kw)
+                                    else:
+                                        await userbot.send_document(d_id, f_path, caption=cap or None, **kw)
+                                    forwarded = True
+                                except Exception as send_err:
+                                    live_progress[prog_key]["errors"] = live_progress[prog_key].get("errors", 0) + 1
+                                    logger.error(f"DL+Upload send error [{user_id}] to {d_id}: {send_err}")
+                finally:
+                    live_progress[prog_key]["current_file"] = ""
+                    live_progress[prog_key]["current_size"] = 0
+                    live_progress[prog_key]["downloaded_size"] = 0
+                    live_progress[prog_key]["method"] = "idle"
+                    for pp in [f_path, thumb_path]:
+                        if pp and os.path.exists(pp):
+                            try: os.remove(pp)
+                            except: pass
 
         if forwarded:
             live_progress[prog_key]["forwarded"] = live_progress[prog_key].get("forwarded", 0) + 1
             live_progress[prog_key]["last_update"] = time.time()
             await increment_live_stats(user_id, source_channel)
-            await increment_channel_stat(user_id, dest_channel)
-            logger.info(f"Live forwarded: {source_channel} → {dest_channel} [{user_id}]")
+            for dc in dest_channels:
+                await increment_channel_stat(user_id, dc)
+            logger.info(f"Live forwarded: {source_channel} → {dest_channels} [{user_id}]")
 
     except asyncio.CancelledError:
         raise
