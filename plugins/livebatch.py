@@ -28,11 +28,22 @@ MAX_DL_SIZE = 2 * 1024 * 1024 * 1024  # 2 GB limit for DL+Upload
 # ══════════════════════════════════════════════════
 # STATE STORES
 # ══════════════════════════════════════════════════
-live_tasks   = {}      # (user_id, source) → asyncio.Task (queue processor)
-live_queues  = {}      # (user_id, source) → asyncio.Queue
-live_progress = {}     # (user_id, source) → progress_dict
-livebatch_states = {}      # user_id → setup step dict
-live_filter_edit_state = {}  # user_id → {"source": id, "filters": {...}}
+live_tasks    = {}   # user_id → {source → asyncio.Task}  (queue processor per source)
+live_queues   = {}   # (user_id, source) → asyncio.Queue
+live_progress = {}   # (user_id, source) → progress_dict
+livebatch_states = {}       # user_id → setup step dict
+live_filter_edit_state = {} # user_id → {"source": id, "filters": {...}}
+
+# ── Shared userbot store ──
+# ONE Client per user_id — shared across ALL monitors for that user.
+# This is the critical design: multiple Pyrogram Client instances on the
+# same session string cause Telegram to drop the older connection, which
+# is why only the latest monitor received messages. Now we open exactly
+# one connection per user and route messages to per-source queues.
+_user_userbots = {}   # user_id → pyrogram.Client (running)
+_user_ub_lock  = {}   # user_id → asyncio.Lock  (prevent double-start races)
+_user_sources  = {}   # user_id → set of source channel ids being monitored
+_user_ub_handler_installed = set()  # user_ids whose fan-out handler is installed
 
 # ══════════════════════════════════════════════════
 # HELPERS
@@ -144,8 +155,9 @@ def _build_filter_kb(filters: dict, confirm_cb: str,
         row = []
         for key, label in _FILTER_PAIRS[i:i+2]:
             active = is_all or filters.get(key, False)
+            icon = "✅" if active else "❌"
             row.append(InlineKeyboardButton(
-                f"{'\u2705' if active else '\u274c'} {label}",
+                f"{icon} {label}",
                 callback_data=f"{tog_prefix}{key}"
             ))
         rows.append(row)
@@ -448,8 +460,11 @@ async def livebatch_callback_handler(client, callback):
         prog = live_progress.get(key, {})
         title = m.get("source_title") or str(source)
         status = "🟢 Active" if m["active"] else "⏸ Paused"
-        task_alive = user_id in live_tasks and source in live_tasks.get(user_id, {})
+        task_obj = live_tasks.get(user_id, {}).get(source)
+        task_alive = task_obj is not None and not task_obj.done()
+        ub_alive = user_id in _user_userbots and _user_userbots[user_id].is_connected
         engine_status = "✅ Engine Running" if task_alive else "💤 Engine Stopped"
+        ub_status = "🔗 Connected" if ub_alive else "⚠️ Disconnected"
         fwd = m.get("msg_count", 0)
         pending = prog.get("pending", 0)
         skipped = prog.get("skipped", 0)
@@ -488,6 +503,7 @@ async def livebatch_callback_handler(client, callback):
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🔋 **Status:** {status}\n"
             f"⚙️ **Engine:** {engine_status}\n"
+            f"🌐 **Userbot:** {ub_status}\n"
             f"🔇 **Silent Mode:** {silent_mode}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
             f"✅ **Forwarded:** `{fwd}` messages\n"
@@ -534,11 +550,16 @@ async def livebatch_callback_handler(client, callback):
         try: source = int(source_str)
         except: source = source_str
         await delete_live_monitor(user_id, source)
+        # Cancel queue-processor task
         if user_id in live_tasks and source in live_tasks[user_id]:
             live_tasks[user_id][source].cancel()
             del live_tasks[user_id][source]
         live_queues.pop((user_id, source), None)
         live_progress.pop(progress_key(user_id, source), None)
+        # Remove from shared-userbot source registry
+        if user_id in _user_sources:
+            _user_sources[user_id].discard(source)
+        asyncio.create_task(_stop_userbot_if_idle(user_id))
         await callback.answer("✅ Monitor removed!", show_alert=True)
         await show_livebatch_menu(callback.message, user_id, limit, is_edit=True)
 
@@ -572,9 +593,13 @@ async def livebatch_callback_handler(client, callback):
                 await start_monitor_task(client, user_id, source, m["dest"])
                 await callback.answer("▶️ Monitor resumed!", show_alert=True)
             else:
+                # Pause: cancel queue processor and remove from shared routing
                 if user_id in live_tasks and source in live_tasks.get(user_id, {}):
                     live_tasks[user_id][source].cancel()
                     del live_tasks[user_id][source]
+                if user_id in _user_sources:
+                    _user_sources[user_id].discard(source)
+                asyncio.create_task(_stop_userbot_if_idle(user_id))
                 await callback.answer("⏸ Monitor paused!", show_alert=True)
         await show_livebatch_menu(callback.message, user_id, limit, is_edit=True)
 
@@ -741,83 +766,203 @@ async def _handle_live_open_dest_picker(client, callback):
 # ══════════════════════════════════════════════════
 # MONITOR TASK ENGINE (Queue-based)
 # ══════════════════════════════════════════════════
+# ══════════════════════════════════════════════════
+# SHARED USERBOT MANAGER
+# ══════════════════════════════════════════════════
+async def _get_or_start_userbot(user_id: int) -> "Client | None":
+    """
+    Return the running shared userbot for this user.
+    If it does not exist yet, create & start it.
+    Only ONE Client instance per user — shared across ALL monitors.
+    """
+    if user_id not in _user_ub_lock:
+        _user_ub_lock[user_id] = asyncio.Lock()
+
+    async with _user_ub_lock[user_id]:
+        existing = _user_userbots.get(user_id)
+        if existing is not None:
+            # Check the client is still alive
+            try:
+                if existing.is_connected:
+                    return existing
+            except Exception:
+                pass
+            # Stale — clean up and recreate
+            try:
+                await existing.stop()
+            except Exception:
+                pass
+            _user_userbots.pop(user_id, None)
+
+        session = await get_session(user_id)
+        if not session:
+            logger.error(f"[SharedUB] No session for user {user_id}")
+            return None
+
+        ub = Client(
+            f"live_shared_{user_id}",
+            api_id=API_ID, api_hash=API_HASH,
+            session_string=session, in_memory=True
+        )
+        await ub.start()
+        _user_userbots[user_id] = ub
+        _user_sources[user_id]  = set()
+        _user_ub_handler_installed.discard(user_id)  # Reset so handler is re-installed
+        logger.info(f"[SharedUB] Started shared userbot for user {user_id}")
+        return ub
+
+
+async def _register_source_on_userbot(ub: "Client", user_id: int, source_channel):
+    """
+    Register a new source channel on the shared userbot.
+    The single on_message handler fans out to all per-source queues.
+    Handler is installed exactly once per userbot lifecycle.
+    """
+    sources = _user_sources.setdefault(user_id, set())
+    if source_channel in sources:
+        return   # Already registered
+
+    sources.add(source_channel)
+
+    if user_id not in _user_ub_handler_installed:
+        # Install the shared fan-out handler exactly once
+        _user_ub_handler_installed.add(user_id)
+
+        @ub.on_message(~filters.service)
+        async def _shared_enqueue(ub_client, msg):
+            # Identify which source this message belongs to
+            src = getattr(msg, "chat", None)
+            if not src:
+                return
+            chat_id = src.id
+
+            # Check against all monitored sources for this user
+            monitored = _user_sources.get(user_id, set())
+            if chat_id not in monitored:
+                return
+
+            q_key = (user_id, chat_id)
+            q = live_queues.get(q_key)
+            if q is None:
+                return
+
+            pk = progress_key(user_id, chat_id)
+            await q.put(msg)
+            if pk in live_progress:
+                live_progress[pk]["pending"] = q.qsize()
+
+        logger.info(f"[SharedUB] Installed fan-out handler for user {user_id}")
+    else:
+        # Additional sources are automatically covered by the existing handler.
+        logger.info(f"[SharedUB] Added source {source_channel} to existing handler for user {user_id}")
+
+
+async def _stop_userbot_if_idle(user_id: int):
+    """Stop the shared userbot if no more sources are monitored."""
+    if _user_sources.get(user_id):
+        return  # Still has active sources
+    ub = _user_userbots.pop(user_id, None)
+    _user_ub_handler_installed.discard(user_id)
+    if ub:
+        try:
+            await ub.stop()
+        except Exception:
+            pass
+        logger.info(f"[SharedUB] Stopped idle shared userbot for user {user_id}")
+
+
+# ══════════════════════════════════════════════════
+# MONITOR TASK ENGINE (Queue-based, Shared Userbot)
+# ══════════════════════════════════════════════════
 async def start_monitor_task(client, user_id, source_channel, dest_channels):
+    """
+    Start (or restart) the queue-processor task for one source channel.
+    The shared userbot is obtained/started once per user and reused.
+    """
     if not isinstance(dest_channels, list):
         dest_channels = [dest_channels]
     if user_id not in live_tasks:
         live_tasks[user_id] = {}
-    if source_channel in live_tasks[user_id]:
-        live_tasks[user_id][source_channel].cancel()
 
+    # Cancel any existing processor task for this source
+    old_task = live_tasks[user_id].get(source_channel)
+    if old_task and not old_task.done():
+        old_task.cancel()
+        try:
+            await asyncio.wait_for(asyncio.shield(old_task), timeout=3)
+        except Exception:
+            pass
+
+    # Create a fresh queue for this source
     q = asyncio.Queue()
     live_queues[(user_id, source_channel)] = q
     key = init_progress(user_id, source_channel)
 
+    # Ensure the shared userbot is running and this source is registered
+    ub = await _get_or_start_userbot(user_id)
+    if ub is None:
+        logger.error(f"[Monitor] Cannot start — no userbot for user {user_id}")
+        return
+    await _register_source_on_userbot(ub, user_id, source_channel)
+
+    # Spawn the queue-processor coroutine
     task = asyncio.create_task(
-        monitor_channel(client, user_id, source_channel, dest_channels, q, key)
+        _queue_processor(ub, client, user_id, source_channel, dest_channels, q, key)
     )
     live_tasks[user_id][source_channel] = task
-    logger.info(f"Started live monitor: User {user_id}, Source {source_channel}, Dests {len(dest_channels)}")
+    logger.info(f"[Monitor] Started: user={user_id} source={source_channel} dests={len(dest_channels)}")
 
-async def monitor_channel(client, user_id, source_channel, dest_channels, q: asyncio.Queue, prog_key):
-    """Runs userbot, enqueues messages, processes them one by one."""
-    userbot = None
+
+async def _queue_processor(userbot, bot, user_id, source_channel, dest_channels,
+                            q: asyncio.Queue, prog_key):
+    """
+    Pure queue consumer — no userbot lifecycle here.
+    The shared userbot is managed by _get_or_start_userbot / _stop_userbot_if_idle.
+    """
+    logger.info(f"[QueueProc] Running: user={user_id} source={source_channel}")
     try:
-        session = await get_session(user_id)
-        if not session:
-            logger.error(f"No session for user {user_id}")
-            return
-
-        userbot = Client(
-            f"live_{user_id}_{source_channel}",
-            api_id=API_ID, api_hash=API_HASH,
-            session_string=session, in_memory=True
-        )
-        await userbot.start()
-        logger.info(f"Monitor userbot UP: {user_id}/{source_channel}")
-
-        # Enqueue incoming messages instantly — NEVER miss!
-        @userbot.on_message(filters.chat(source_channel) & ~filters.service)
-        async def enqueue_handler(ub_client, msg):
-            await q.put(msg)
-            if prog_key in live_progress:
-                live_progress[prog_key]["pending"] = q.qsize()
-
-        # Process queue
         while True:
             try:
                 msg = await asyncio.wait_for(q.get(), timeout=60)
             except asyncio.TimeoutError:
+                # Keep-alive: check if userbot is still connected
+                ub = _user_userbots.get(user_id)
+                if ub is None or not ub.is_connected:
+                    logger.warning(f"[QueueProc] Userbot gone for user {user_id}, restarting...")
+                    new_ub = await _get_or_start_userbot(user_id)
+                    if new_ub:
+                        await _register_source_on_userbot(new_ub, user_id, source_channel)
+                        userbot = new_ub
                 continue
 
-            live_progress[prog_key]["pending"] = q.qsize()
+            if prog_key in live_progress:
+                live_progress[prog_key]["pending"] = q.qsize()
+
             try:
+                # Re-fetch the live userbot reference in case it was restarted
+                current_ub = _user_userbots.get(user_id, userbot)
                 await process_live_message(
-                    userbot, client, user_id, source_channel, dest_channels, msg, prog_key
+                    current_ub, bot, user_id, source_channel, dest_channels, msg, prog_key
                 )
             except FloodWait as fw:
-                logger.warning(f"Core FloodWait [{user_id}]: {fw.value}s restriction. Sleeping and re-queueing msg.")
+                logger.warning(f"[QueueProc] FloodWait {fw.value}s [{user_id}/{source_channel}]")
                 await asyncio.sleep(fw.value + 2)
-                # Re-queue the message to ensure it is not skipped!
+                # Re-queue so message is NOT lost
                 await q.put(msg)
             except ValueError as ve:
                 if str(ve) == "FLOOD_WAIT_0B":
-                    logger.warning(f"Core Media FloodWait [{user_id}]: Telegram forced a ~50 min block. Auto-pausing monitor.")
+                    logger.warning(f"[QueueProc] FLOOD_WAIT_0B [{user_id}] — sleeping 50 min")
                     await asyncio.sleep(3000)
                     await q.put(msg)
                 else:
-                    logger.error(f"Live processing ValueError [{user_id}]: {ve}")
-                
+                    logger.error(f"[QueueProc] ValueError [{user_id}/{source_channel}]: {ve}")
+
             q.task_done()
 
     except asyncio.CancelledError:
-        logger.info(f"Monitor cancelled: {user_id}/{source_channel}")
+        logger.info(f"[QueueProc] Cancelled: user={user_id} source={source_channel}")
     except Exception as e:
-        logger.error(f"Monitor crash [{user_id}/{source_channel}]: {e}")
-    finally:
-        if userbot:
-            try: await userbot.stop()
-            except: pass
+        logger.error(f"[QueueProc] Crash [{user_id}/{source_channel}]: {e}")
 
 async def process_live_message(userbot, bot, user_id, source_channel, dest_channels, msg, prog_key):
     """Process a single queued message — forwards to ALL dest channels."""
