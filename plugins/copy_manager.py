@@ -220,7 +220,7 @@ async def handle_batch_input(client, message):
                 await message.reply_text(
                     "🔮 **Protected Channel Detected!** 🪄\n\n"
                     "Whoa there! This channel is under a magical protection spell! ✨\n\n"
-                    "**मेरा जादू मुझ पर ही चलेगा!**\n"
+                    "**अरे रुकिए! यह चैनल एक जादुई सुरक्षा कवच के अधीन है!**\n"
                     "_(My magic works for me only!)_\n\n"
                     "You cannot extract from this protected channel. 🛡️\n\n"
                     "Try another channel or contact the admin if you think this is an error."
