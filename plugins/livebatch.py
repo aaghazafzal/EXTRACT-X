@@ -42,8 +42,27 @@ live_filter_edit_state = {} # user_id → {"source": id, "filters": {...}}
 # one connection per user and route messages to per-source queues.
 _user_userbots = {}   # user_id → pyrogram.Client (running)
 _user_ub_lock  = {}   # user_id → asyncio.Lock  (prevent double-start races)
-_user_sources  = {}   # user_id → set of source channel ids being monitored
+_user_sources  = {}   # user_id → set of int source channel ids being monitored
 _user_ub_handler_installed = set()  # user_ids whose fan-out handler is installed
+
+def _norm_source(source_channel):
+    """Normalize source_channel to int where possible.
+    Private channels are always int (-100xxx). Public @username stays str.
+    This ensures live_queues keys & _user_sources entries match msg.chat.id (always int).
+    """
+    if isinstance(source_channel, str):
+        try:
+            return int(source_channel)
+        except ValueError:
+            return source_channel  # keep as @username string
+    return source_channel
+
+def get_shared_userbot(user_id: int):
+    """Return the running shared userbot for user_id, or None.
+    Exposed so copy_manager can REUSE it instead of creating a second
+    Pyrogram session (which would kill LiveBatch update delivery).
+    """
+    return _user_userbots.get(user_id)
 
 # ══════════════════════════════════════════════════
 # HELPERS
@@ -815,46 +834,48 @@ async def _get_or_start_userbot(user_id: int) -> "Client | None":
 async def _register_source_on_userbot(ub: "Client", user_id: int, source_channel):
     """
     Register a new source channel on the shared userbot.
-    The single on_message handler fans out to all per-source queues.
-    Handler is installed exactly once per userbot lifecycle.
+    source_channel must already be normalized (int for private, str for public).
+    Handler is installed exactly once per userbot lifecycle and fans-out
+    to all per-source queues dynamically.
     """
     sources = _user_sources.setdefault(user_id, set())
     if source_channel in sources:
         return   # Already registered
 
     sources.add(source_channel)
+    logger.info(f"[SharedUB] Registered source {source_channel} for user {user_id}. Total: {len(sources)}")
 
     if user_id not in _user_ub_handler_installed:
-        # Install the shared fan-out handler exactly once
+        # Install the shared fan-out handler exactly once per userbot lifecycle
         _user_ub_handler_installed.add(user_id)
 
         @ub.on_message(~filters.service)
         async def _shared_enqueue(ub_client, msg):
-            # Identify which source this message belongs to
             src = getattr(msg, "chat", None)
             if not src:
                 return
+            # msg.chat.id is ALWAYS int from Pyrogram — sources set also holds int
             chat_id = src.id
 
-            # Check against all monitored sources for this user
             monitored = _user_sources.get(user_id, set())
             if chat_id not in monitored:
-                return
+                # Also try string form for @username public channels
+                if f"@{getattr(src, 'username', '')}" not in monitored:
+                    return
+                chat_id = f"@{src.username}"
 
-            q_key = (user_id, chat_id)
-            q = live_queues.get(q_key)
+            q = live_queues.get((user_id, chat_id))
             if q is None:
                 return
 
-            pk = progress_key(user_id, chat_id)
             await q.put(msg)
+            pk = progress_key(user_id, chat_id)
             if pk in live_progress:
                 live_progress[pk]["pending"] = q.qsize()
 
         logger.info(f"[SharedUB] Installed fan-out handler for user {user_id}")
     else:
-        # Additional sources are automatically covered by the existing handler.
-        logger.info(f"[SharedUB] Added source {source_channel} to existing handler for user {user_id}")
+        logger.info(f"[SharedUB] Source {source_channel} added to existing handler (user {user_id})")
 
 
 async def _stop_userbot_if_idle(user_id: int):
@@ -878,7 +899,12 @@ async def start_monitor_task(client, user_id, source_channel, dest_channels):
     """
     Start (or restart) the queue-processor task for one source channel.
     The shared userbot is obtained/started once per user and reused.
+    source_channel is normalized to int (private channels) or str (@username)
+    so it always matches msg.chat.id from Pyrogram.
     """
+    # ── Normalize source type so all keys are consistent ──────────────
+    source_channel = _norm_source(source_channel)
+
     if not isinstance(dest_channels, list):
         dest_channels = [dest_channels]
     if user_id not in live_tasks:
@@ -893,7 +919,7 @@ async def start_monitor_task(client, user_id, source_channel, dest_channels):
         except Exception:
             pass
 
-    # Create a fresh queue for this source
+    # Create a fresh queue for this source (keyed by normalized int/str)
     q = asyncio.Queue()
     live_queues[(user_id, source_channel)] = q
     key = init_progress(user_id, source_channel)

@@ -372,25 +372,53 @@ async def start_copy_job(bot, message, user_id, link, limit, dest_channels=None)
                 # Guarantee resolution by prefixing @
                 source_id = f"@{parts[-2]}" if not parts[-2].startswith("@") else parts[-2]
             
-            # Prefer Userbot if session exists (to bypass destination channel permission limits)
+            # ── Userbot selection (critical for LiveBatch safety) ────────────
+            # If a LiveBatch shared userbot is already running for this user,
+            # REUSE it. Creating a second Pyrogram Client with the same session
+            # makes Telegram stop sending updates to the first one → LiveBatch
+            # messages get dropped during batch.
+            _batch_owns_userbot = False  # True if we started it; we must NOT stop it
+
             if session:
-                userbot = Client(f"worker_{user_id}", api_id=API_ID, api_hash=API_HASH, session_string=session, in_memory=True)
-                try:
-                    await userbot.start()
-                    # WARM UP Pyrogram's in-memory database to prevent PeerIdInvalid for destination channels later
-                    try:
-                        async for _ in userbot.get_dialogs(limit=200): pass
-                    except: pass
-                except Exception as e:
-                    await status_msg.edit_text(f"🚫 **Login Error**\n\nCould not connect to user account.\nReason: `{e}`")
-                    if user_id in active_jobs: del active_jobs[user_id]
-                    return
+                # Import here to avoid circular import
+                from plugins.livebatch import get_shared_userbot, _get_or_start_userbot
+                userbot = get_shared_userbot(user_id)
+
+                if userbot is not None and userbot.is_connected:
+                    # ✅ Reuse the shared livebatch userbot — no new connection
+                    logger.info(f"[Batch] Reusing shared livebatch userbot for user {user_id}")
+                else:
+                    # No livebatch running → start the shared one (so it can be
+                    # picked up by livebatch later too if needed)
+                    userbot = await _get_or_start_userbot(user_id)
+                    if userbot is None:
+                        # Fallback: create a local-only client for this batch
+                        userbot = Client(
+                            f"worker_{user_id}", api_id=API_ID, api_hash=API_HASH,
+                            session_string=session, in_memory=True
+                        )
+                        try:
+                            await userbot.start()
+                            _batch_owns_userbot = True
+                            try:
+                                async for _ in userbot.get_dialogs(limit=200): pass
+                            except: pass
+                        except Exception as e:
+                            await status_msg.edit_text(
+                                f"🚫 **Login Error**\n\nCould not connect to user account.\nReason: `{e}`"
+                            )
+                            if user_id in active_jobs: del active_jobs[user_id]
+                            return
+                    else:
+                        logger.info(f"[Batch] Started shared userbot for user {user_id} (batch-initiated)")
             else:
                 if not is_public:
-                    await status_msg.edit_text("🚫 **Login Error**\n\nYou need to login to extract from private channels.")
+                    await status_msg.edit_text(
+                        "🚫 **Login Error**\n\nYou need to login to extract from private channels."
+                    )
                     if user_id in active_jobs: del active_jobs[user_id]
                     return
-            # Use Main Bot if not logged in (and channel is public)
+                # Use main bot for public channels
                 userbot = bot
             
             # Pre-download custom thumbnail (so it's extremely fast for all messages)
@@ -1011,7 +1039,10 @@ async def start_copy_job(bot, message, user_id, link, limit, dest_channels=None)
             await asyncio.sleep(2.0) # Safety between GetMessages
         
         worker_client = locals().get('userbot')
-        if worker_client and worker_client != bot:
+        # Only stop the userbot if THIS batch job started it exclusively.
+        # If it's the shared livebatch userbot, leave it running.
+        _owns = locals().get('_batch_owns_userbot', False)
+        if _owns and worker_client and worker_client != bot:
             try: await worker_client.stop()
             except: pass
         
